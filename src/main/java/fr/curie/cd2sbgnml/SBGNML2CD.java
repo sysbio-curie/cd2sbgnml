@@ -5,11 +5,12 @@ import fr.curie.cd2sbgnml.graphics.CdShape;
 import fr.curie.cd2sbgnml.graphics.GeometryUtils;
 import fr.curie.cd2sbgnml.graphics.Link;
 import fr.curie.cd2sbgnml.model.LinkModel;
+import fr.curie.cd2sbgnml.model.LogicGate;
 import fr.curie.cd2sbgnml.model.Process;
 import fr.curie.cd2sbgnml.xmlcdwrappers.*;
 import fr.curie.cd2sbgnml.model.ReactantModel;
 import fr.curie.cd2sbgnml.xmlcdwrappers.ReactantWrapper.ReactantType;
-import fr.curie.cd2sbgnml.xmlcdwrappers.ReactionWrapper.ReactionType;
+import fr.curie.cd2sbgnml.xmlcdwrappers.ReactionType;
 import org.sbfc.converter.GeneralConverter;
 import org.sbfc.converter.exceptions.ConversionException;
 import org.sbfc.converter.exceptions.ReadModelException;
@@ -18,7 +19,6 @@ import org.sbgn.ArcClazz;
 import org.sbgn.bindings.*;
 import org.sbgn.GlyphClazz;
 import org.sbgn.bindings.Map;
-import org.sbgn.bindings.Point;
 import org.sbml._2001.ns.celldesigner.*;
 import org.sbml.sbml.level2.version4.*;
 import org.sbml.sbml.level2.version4.OriginalModel.ListOfCompartments;
@@ -29,13 +29,15 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.w3c.dom.Element;
 
+import java.awt.geom.AffineTransform;
 import java.awt.geom.Line2D;
 import java.awt.geom.Point2D;
 import java.awt.geom.Rectangle2D;
-import java.io.StringWriter;
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.util.*;
+import java.util.AbstractMap.SimpleEntry;
+import java.util.stream.Collectors;
 
 import static org.sbgn.GlyphClazz.*;
 
@@ -55,11 +57,32 @@ public class SBGNML2CD extends GeneralConverter {
      * Keep track of created aliasWrappers to be referred to.
      */
     java.util.Map<String, AliasWrapper> aliasWrapperMap;
+    java.util.Map<String, SpeciesWrapper> speciesWrapperMap;
+    java.util.Map<String, Protein> protMap;
+    java.util.Map<String, RNA> rnaMap;
+    java.util.Map<String, Gene> geneMap;
+    java.util.Map<String, AntisenseRNA> asrnaMap;
+
 
     /**
      * This map indexes all the arcs connected to each process node.
      */
     java.util.Map<String, List<Arc>> processToArcs;
+
+    /**
+     * This list will contain all arcs that are not linked to any process node.
+     * For example, phenotype arcs.
+     * Or AF map arcs.
+     */
+    List<Arc> orphanArcs;
+
+    /**
+     * HashSet containing all logic gate glyphs that aren't associated to any process.
+     * The set is first built with all logic gates in the map, and they are removed as reactions are processed, if
+     * they are connected to a process.
+     * After all reactions are processed, only the orphan logic gates will remain in the set.
+     */
+    HashSet<Glyph> orphanLogicGates;
 
     /**
      * Those 2 maps index the source and target glyph attached to each link.
@@ -71,19 +94,39 @@ public class SBGNML2CD extends GeneralConverter {
 
     java.util.Map<String, Glyph> portToGlyph;
 
+    java.util.Map<String, List<Arc>> glyphToArc;
+
 
     public Sbml toCD(Sbgn sbgn) {
 
         sbgn = SBGNUtils.sanitizeIds(sbgn);
 
         // consider only the first map
-        Map sbgnMap = sbgn.getMap().get(0);
+        Map sbgnMap = sbgn.getMap(); //.get(0);
 
         // init celldesigner file
         sbml = this.initFile(sbgnMap);
 
         // init the index maps
         this.buildMaps(sbgnMap);
+
+        // put notes and annotations from map to model
+        if(sbgnMap.getNotes() != null
+                && sbgnMap.getNotes().getAny().size() > 0) {
+            Element notesE = sbgnMap.getNotes().getAny().get(0);
+            SBase.Notes notes = new SBase.Notes();
+            notes.getAny().add(notesE);
+            sbml.getModel().setNotes(notes);
+        }
+
+        if(sbgnMap.getExtension() != null) {
+            for(Element e: sbgnMap.getExtension().getAny()){
+                if(e.getTagName().equals("annotation")) {
+                    Element rdf = SBGNUtils.sanitizeRdfURNs((Element) e.getElementsByTagName("rdf:RDF").item(0));
+                    sbml.getModel().getAnnotation().getAny().add(rdf);
+                }
+            }
+        }
 
 
         /*
@@ -108,6 +151,7 @@ public class SBGNML2CD extends GeneralConverter {
                 case PHENOTYPE:
                 case SOURCE_AND_SINK:
                 case PERTURBING_AGENT:
+                case SUBMAP:
                     processSpecies(glyph, false, false, null, null);
                     break;
                 case COMPLEX:
@@ -131,25 +175,200 @@ public class SBGNML2CD extends GeneralConverter {
             }
         }
 
+        // now process the remaining orphan arcs
+        for(Arc orphanArc: orphanArcs) {
+            processOrphanArc(orphanArc);
+        }
+
+        // process the remaining orphan logic gates
+        for(Glyph orphanLogic: orphanLogicGates) {
+            processLogicReaction(orphanLogic);
+        }
+
+        processEnd();
+
 
 
         return sbml;
     }
 
+    private void processEnd() {
+        for(SpeciesWrapper speciesW: speciesWrapperMap.values()){
+            // add species to correct list
+            if(speciesW.isIncludedSpecies()) {
+                ListOfIncludedSpecies listOfIncludedSpecies =
+                        sbml.getModel().getAnnotation().getExtension().getListOfIncludedSpecies();
+
+                // create listofincluded if not already there
+                if(listOfIncludedSpecies == null) {
+                    listOfIncludedSpecies = new ListOfIncludedSpecies();
+                    sbml.getModel().getAnnotation().getExtension().setListOfIncludedSpecies(listOfIncludedSpecies);
+                }
+                org.sbml._2001.ns.celldesigner.Species species = speciesW.getCDIncludedSpecies();
+                listOfIncludedSpecies.getSpecies().add(species);
+            }
+            else {
+                Species species = speciesW.getCDNormalSpecies();
+                sbml.getModel().getListOfSpecies().getSpecies().add(species);
+            }
+        }
+
+        for(Protein p: protMap.values()) {
+            sbml.getModel().getAnnotation().getExtension().getListOfProteins().getProtein().add(p);
+        }
+        for(Gene p: geneMap.values()) {
+            sbml.getModel().getAnnotation().getExtension().getListOfGenes().getGene().add(p);
+        }
+        for(RNA p: rnaMap.values()) {
+            sbml.getModel().getAnnotation().getExtension().getListOfRNAs().getRNA().add(p);
+        }
+        for(AntisenseRNA p: asrnaMap.values()) {
+            sbml.getModel().getAnnotation().getExtension().getListOfAntisenseRNAs().getAntisenseRNA().add(p);
+        }
+    }
+
+    /**
+     * Logic gate reactions have different features than all other reactions in CellDesigner.
+     * They can have more than 2 baseReactants. Instead of modifications, they have gateMembers listed.
+     * @param logicGlyph
+     */
+    private void processLogicReaction(Glyph logicGlyph) {
+        List<Arc> connectedArcs = glyphToArc.get(logicGlyph.getId());
+        Point2D.Float logicCoords = new Point2D.Float(
+                logicGlyph.getBbox().getX() + logicGlyph.getBbox().getW() / 2,
+                logicGlyph.getBbox().getY() + logicGlyph.getBbox().getH() / 2
+        );
+
+        ReactionType reactionCDClass = ReactionType.BOOLEAN_LOGIC_GATE;
+
+        List<List<Arc>> tmp = SBGNUtils.getBLGReactantTypes(connectedArcs);
+        List<Arc> reactants = tmp.get(0);
+        Arc productArc = tmp.get(1).get(0);
+
+        List<ReactantWrapper> baseReactantsW = new ArrayList<>();
+        List<Glyph> baseReactantGlyphs = new ArrayList<>();
+        List<Arc> baseReactantArcs = new ArrayList<>();
+
+        List<String> aliases = new ArrayList<>();
+        List<String> speciesModifiers = new ArrayList<>();
+
+        for(Arc arc: reactants) {
+            Glyph g = arcToSource.get(arc.getId());
+
+            AliasWrapper aliasW = aliasWrapperMap.get(g.getId()+"_alias1");
+
+            ReactantWrapper baseWrapper = new ReactantWrapper(aliasW, ReactantType.BASE_REACTANT);
+            //baseWrapper.setAnchorPoint(AnchorPoint.CENTER); // set to CENTER for now, but better computed after
+
+            // incoming arcs have the type of the product arc
+            baseWrapper.setModificationLinkType(
+                    ModificationLinkType.valueOf(
+                            LinkModel.getCdClass(
+                                    ArcClazz.fromClazz(productArc.getClazz()))));
+
+            baseReactantsW.add(baseWrapper);
+            baseReactantGlyphs.add(g);
+            baseReactantArcs.add(arc);
+            aliases.add(aliasW.getId());
+            speciesModifiers.add(aliasW.getSpeciesId());
+        }
+
+        Glyph baseProductGlyph = arcToTarget.get(productArc.getId());
+        AliasWrapper aliasW = aliasWrapperMap.get(baseProductGlyph.getId()+"_alias1");
+        ReactantWrapper baseProductW = new ReactantWrapper(aliasW, ReactantType.BASE_PRODUCT);
+        baseProductW.setModificationLinkType(
+                ModificationLinkType.valueOf(
+                        LinkModel.getCdClass(
+                                ArcClazz.fromClazz(productArc.getClazz()))));
+
+        ReactionWrapper reactionW = new ReactionWrapper(logicGlyph.getId().replaceAll("-","_"),
+                reactionCDClass, baseReactantsW, Collections.singletonList(baseProductW));
+
+        // 1st product link = logic gate associated link
+        SimpleEntry<Link, Link> tmpProductLink = baseLinkProcessingStep1(baseProductW,
+                baseProductGlyph,
+                productArc,
+                logicCoords,
+                false,
+                new ReactionFeatures(false, true, false));
+        List<Point2D.Float> localEditPointsProduct = tmpProductLink.getKey().getEditPoints();
+        Point2D.Float finalEndPoint = tmpProductLink.getKey().getEnd();
+        Link productLink = tmpProductLink.getValue();
+        // apply translation factor on logic gate
+        Point2D.Float logicPoint = new Point2D.Float(
+                (float) (logicCoords.getX() - mapBounds.getX()),
+                (float) (logicCoords.getY() - mapBounds.getY()));
+        LineWrapper productLineWrapper = buildLineWrapper(productArc.getId(), localEditPointsProduct, logicPoint);
+
+        LogicGateWrapper logicW = new LogicGateWrapper(
+                baseProductW,
+                LogicGate.getLogicGateType(GlyphClazz.fromClazz(logicGlyph.getClazz())),
+                speciesModifiers,
+                aliases,
+                baseProductW.getModificationLinkType());
+        logicW.setLineWrapper(productLineWrapper);
+        logicW.setTargetLineIndex("-1,0");
+        reactionW.getModifiers().add(logicW);
+
+
+        int i=0;
+        //java.util.Map<String, List<Point2D.Float>> arcsId2Editpoints = new LinkedHashMap<>();
+        for(ReactantWrapper reactantW: baseReactantsW) {
+            List<Point2D.Float> localEditPoints0 = baseLinkProcessingStep1(reactantW,
+                    baseReactantGlyphs.get(i),
+                    baseReactantArcs.get(i),
+                    logicCoords,
+                    true,
+                    new ReactionFeatures(false, true, false, true)).getKey().getEditPoints();
+
+            reactantW.setTargetLineIndex("-1,0");
+            List<String> editPointStringList = new ArrayList<>();
+            for(Point2D.Float p: localEditPoints0) {
+                editPointStringList.add(p.getX()+","+p.getY());
+            }
+
+            LineWrapper lineWrapper = buildLineWrapper(baseReactantArcs.get(i).getId(),
+                    localEditPoints0, null);
+            reactantW.setLineWrapper(lineWrapper);
+
+
+            //arcsId2Editpoints.put(baseReactantArcs.get(i).getId(), localEditPoints0);
+            i++;
+        }
+
+        //arcsId2Editpoints.put(productArc.getId(), localEditPointsProduct);
+
+        List<String> baseReactionEditPointString = new ArrayList<>();
+        /*List<Point2D.Float> mergedList = new ArrayList<>();
+        mergedList.addAll(productLink.getEditPoints());
+        mergedList.add(logicCoords);*/
+        for(Point2D.Float p: logicW.getLineWrapper().getEditPoints()) {
+            baseReactionEditPointString.add(p.getX()+","+p.getY());
+        }
+
+        Line line = new Line();
+        line.setWidth(BigDecimal.valueOf(1));
+        line.setColor("ff000000");
+
+
+        LineWrapper baseLineWrapper = new LineWrapper(null, baseReactionEditPointString, line);
+        reactionW.setLineWrapper(baseLineWrapper);
+
+        sbml.getModel().getListOfReactions().getReaction().add(reactionW.getCDReaction());
+
+
+    }
+
     private void processReaction(Glyph processGlyph) {
+        // TODO add arc notes and annotations to reaction
         List<Arc> connectedArcs = processToArcs.get(processGlyph.getId());
         Point2D.Float processCoords = new Point2D.Float(
                 processGlyph.getBbox().getX(),
                 processGlyph.getBbox().getY()
         );
-        System.out.println(">>>>process: "+processGlyph.getId());
-        for(Arc arc: connectedArcs) {
-            System.out.println(arc.getId()+" "+arc.getClazz());
-        }
 
         boolean isReversible = SBGNUtils.isReactionReversible(connectedArcs);
         ReactionType reactionCDClass = ReactionType.STATE_TRANSITION; // default to basic reaction type
-        System.out.println("reversible "+isReversible);
 
         /*
             We need to determine the base class of the reaction here, wether it's an association or dissociation.
@@ -161,7 +380,6 @@ public class SBGNML2CD extends GeneralConverter {
         List<Arc> reactants = tmp.get(0);
         List<Arc> products = tmp.get(1);
         List<Arc> modifiers = tmp.get(2);
-        System.out.println("connected glyphs: "+reactants.size()+" "+products.size()+" "+modifiers.size());
 
         // assign correct CellDesigner reaction type
         if(SBGNUtils.isReactionAssociation(processGlyph, reactants, products)) {
@@ -209,7 +427,6 @@ public class SBGNML2CD extends GeneralConverter {
                 g = arcToSource.get(arc.getId());
             }
             AliasWrapper aliasW = aliasWrapperMap.get(g.getId()+"_alias1");
-            System.out.println("Reactant: "+g.getId()+" "+g.getClazz());
 
             // set the first 2 as basereactants for association, if dissociation or normal reaction only the 1st
             if((reactionCDClass == ReactionType.HETERODIMER_ASSOCIATION &&  i==1)
@@ -236,7 +453,6 @@ public class SBGNML2CD extends GeneralConverter {
         for(Arc arc: products) {
             Glyph g = arcToTarget.get(arc.getId());
             AliasWrapper aliasW = aliasWrapperMap.get(g.getId()+"_alias1");
-            System.out.println("Product: "+g.getId()+" "+g.getClazz());
 
             // for dissociation consider first 2 as base, for association and normal only the 1st
             if(i == 0 || (reactionCDClass == ReactionType.DISSOCIATION && i == 1)) {
@@ -262,13 +478,12 @@ public class SBGNML2CD extends GeneralConverter {
         for(Arc arc: modifiers) {
             Glyph g = arcToSource.get(arc.getId());
             AliasWrapper aliasW = aliasWrapperMap.get(g.getId()+"_alias1");
-            System.out.println("Modification: "+g.getId()+" "+g.getClazz());
 
             ReactantWrapper modifWrapper = new ReactantWrapper(aliasW, ReactantType.MODIFICATION);
             //baseWrapper.setAnchorPoint(AnchorPoint.CENTER); // set to CENTER for now, but better computed after
 
             modifWrapper.setModificationLinkType(
-                    ReactantWrapper.ModificationLinkType.valueOf(
+                    ModificationLinkType.valueOf(
                             LinkModel.getCdClass(
                                     ArcClazz.fromClazz(arc.getClazz()))));
             modificationsW.add(modifWrapper);
@@ -285,389 +500,98 @@ public class SBGNML2CD extends GeneralConverter {
 
         // geometry operations to get corrects reaction links
         if(reactionCDClass == ReactionType.HETERODIMER_ASSOCIATION) {
-            System.out.println("ASSOCIATION REACTION");
+            ReactionFeatures reactionFeatures = new ReactionFeatures(isReversible,true, true);
 
-            // set basic variables
             ReactantWrapper baseReactantW0 = baseReactantsW.get(0);
-            Glyph baseReactantGlyph0 = baseReactantGlyphs.get(0);
-
             ReactantWrapper baseReactantW1 = baseReactantsW.get(1);
-            Glyph baseReactantGlyph1 = baseReactantGlyphs.get(1);
-
             ReactantWrapper baseProductW = baseProductsW.get(0);
-            Glyph baseProductGlyph = baseProductGlyphs.get(0);
 
-            // get point lists in correct order
-            // apply the mapBounds correction to each point of the arc to get consistent coords
-            List<Point2D.Float> reactantPoints0 = applyCorrection(SBGNUtils.getPoints(baseReactantArcs.get(0)),
-                    (float) mapBounds.getX(),(float) mapBounds.getY());
-            List<Point2D.Float> reactantPoints1 = applyCorrection(SBGNUtils.getPoints(baseReactantArcs.get(1)),
-                    (float) mapBounds.getX(),(float) mapBounds.getY());
-            if(isReversible) {
-                Collections.reverse(reactantPoints0);
-                Collections.reverse(reactantPoints1);
-            }
-            Link reactantLink0 = new Link(reactantPoints0);
-            Link reactantLink1 = new Link(reactantPoints1);
-            Link productLink = new Link(applyCorrection(SBGNUtils.getPoints(baseProductArcs.get(0)),
-                    (float) mapBounds.getX(),(float) mapBounds.getY()));
+            SimpleEntry<Point2D.Float, Point2D.Float> tmpResult = getAssocDissocPoints(
+                    Arrays.asList(baseReactantW0, baseReactantW1, baseProductW),
+                    processGlyph,
+                    processCoords,
+                    baseProductArcs.get(0),
+                    true
+            );
+            Point2D.Float absAssocPoint = tmpResult.getKey();
+            Point2D.Float localAssocPoint = tmpResult.getValue();
 
-            // infer best anchorpoints possible
-            Rectangle2D.Float baseRect0 = SBGNUtils.getRectangleFromGlyph(baseReactantGlyph0);
-            baseRect0.setRect(
-                    baseRect0.getX() - mapBounds.getX(),
-                    baseRect0.getY() - mapBounds.getY(),
-                    baseRect0.getWidth(),
-                    baseRect0.getHeight());
-            AnchorPoint startAnchor0 = inferAnchorPoint(reactantLink0.getStart(), baseReactantW0, baseRect0);
-            baseReactantW0.setAnchorPoint(startAnchor0);
 
-            Rectangle2D.Float baseRect1 = SBGNUtils.getRectangleFromGlyph(baseReactantGlyph1);
-            baseRect1.setRect(
-                    baseRect1.getX() - mapBounds.getX(),
-                    baseRect1.getY() - mapBounds.getY(),
-                    baseRect1.getWidth(),
-                    baseRect1.getHeight());
-            AnchorPoint startAnchor1 = inferAnchorPoint(reactantLink1.getStart(), baseReactantW1, baseRect1);
-            baseReactantW1.setAnchorPoint(startAnchor1);
+            List<Point2D.Float> localEditPoints0 = baseLinkProcessingStep1(
+                    baseReactantW0, baseReactantGlyphs.get(0),
+                    baseReactantArcs.get(0), absAssocPoint, true, reactionFeatures).getKey().getEditPoints();
 
-            Rectangle2D.Float productRect = SBGNUtils.getRectangleFromGlyph(baseProductGlyph);
-            productRect.setRect(
-                    productRect.getX() - mapBounds.getX(),
-                    productRect.getY() - mapBounds.getY(),
-                    productRect.getWidth(),
-                    productRect.getHeight());
-            AnchorPoint endAnchor = inferAnchorPoint(productLink.getEnd(), baseProductW, productRect);
-            baseProductW.setAnchorPoint(endAnchor);
+            List<Point2D.Float> localEditPoints1 = baseLinkProcessingStep1(
+                    baseReactantW1, baseReactantGlyphs.get(1),
+                    baseReactantArcs.get(1), absAssocPoint, true, reactionFeatures).getKey().getEditPoints();
 
-            // compute exact final points from the inferred anchor
-            Point2D.Float finalStartPoint0 = getFinalpoint(
-                    baseReactantW0.getAnchorPoint(),
-                    baseReactantW0,
-                    baseRect0);
-            Point2D.Float finalStartPoint1 = getFinalpoint(
-                    baseReactantW1.getAnchorPoint(),
-                    baseReactantW1,
-                    baseRect1);
-            Point2D.Float finalEndPoint = getFinalpoint(
-                    baseProductW.getAnchorPoint(),
-                    baseProductW,
-                    productRect);
+            SimpleEntry<Link, Link> tmpResultPoints = baseLinkProcessingStep1(
+                    baseProductW, baseProductGlyphs.get(0),
+                    baseProductArcs.get(0), absAssocPoint, false, reactionFeatures);
+            List<Point2D.Float> localEditPoints2 = tmpResultPoints.getKey().getEditPoints();
+            Point2D.Float finalEndPoint = tmpResultPoints.getKey().getEnd();
+            Link productLink = tmpResultPoints.getValue();
 
-            // define association glyph absolute point
-            /*
-                If there are ports, consider association to be on the first port, that way all the links are
-                already pointing to it.
-                If no ports, consider the Celldesigner association glyph to be on the process, and move the process
-                a bit. Not too far because it will shift all the additional links and modification links.
-              */
-            Point2D.Float absAssocPoint = null;
-            if(processGlyph.getPort().size() > 0) {
-                // we need to get the port that is on the opposite side of the product
-                Port oppositePort = (Port) baseProductArcs.get(0).getSource();
-                Port consumptionPort = null;
-                for(Port p: processGlyph.getPort()){
-                    if(p != oppositePort) {
-                        consumptionPort = p;
-                        break;
-                    }
-                }
-                absAssocPoint = new Point2D.Float(
-                        consumptionPort.getX() - (float) mapBounds.getX(),
-                        consumptionPort.getY() - (float) mapBounds.getY());
+            processLine = getProcessLine(productLink, absAssocPoint, reactionFeatures);
 
-            }
-            else {
-                absAssocPoint = new Point2D.Float(
-                        (float) (processCoords.getX() - mapBounds.getX()),
-                        (float) (processCoords.getY() - mapBounds.getY())
-                );
-            }
-
-            // compute association glyph relative point
-            System.out.println("Coordinate system: "+baseReactantW0.getCenterPoint()+" "+
-                    baseReactantW1.getCenterPoint()+" "+baseProductW.getCenterPoint());
-            Point2D.Float localAssocPoint = GeometryUtils.convertPoints(
-                    Collections.singletonList(absAssocPoint),
-                    GeometryUtils.getTransformsToLocalCoords(
-                            baseReactantW0.getCenterPoint(),
-                            baseReactantW1.getCenterPoint(),
-                            baseProductW.getCenterPoint()
-                    )).get(0);
-            System.out.println("Assoc coords: "+absAssocPoint+" -> "+localAssocPoint);
-
-            /*  compute branch edit points
-                reverse points for consumption because CellDesigner consider all branches to start from association
-                glyph. Don't reverse points for reversible reactions, as the production arcs already point to the right
-                direction.
-            */
-            System.out.println("Original branch 0: "+reactantLink0.getAllPoints());
-            List<Point2D.Float> editpoints0 = reactantLink0.getEditPoints();
-            if(!isReversible)
-                Collections.reverse(editpoints0);
-            System.out.println("Edit points 0 from assoc: "+editpoints0);
-            List<Point2D.Float> localEditPoints0 = GeometryUtils.convertPoints(
-                    editpoints0,
-                    GeometryUtils.getTransformsToLocalCoords(
-                            absAssocPoint,
-                            finalStartPoint0
-                    ));
-            System.out.println("Branch 0: "+reactantLink0.getEditPoints()+" -> "+localEditPoints0);
-
-            List<Point2D.Float> editpoints1 = reactantLink1.getEditPoints();
-            if(!isReversible)
-                Collections.reverse(editpoints1);
-            List<Point2D.Float> localEditPoints1 = GeometryUtils.convertPoints(
-                    editpoints1,
-                    GeometryUtils.getTransformsToLocalCoords(
-                            absAssocPoint,
-                            finalStartPoint1
-                    ));
-            System.out.println("Branch 1: "+reactantLink1.getEditPoints()+" -> "+localEditPoints1);
-
-            List<Point2D.Float> localEditPoints2 = GeometryUtils.convertPoints(
-                    productLink.getEditPoints(),
-                    GeometryUtils.getTransformsToLocalCoords(
-                            absAssocPoint,
-                            finalEndPoint
-                    ));
-            System.out.println("Branch 2: "+productLink.getEditPoints()+" -> "+localEditPoints2);
-
-            if(productLink.getEditPoints().size() > 0) {
-                processLine = new Line2D.Float(
-                        absAssocPoint,
-                        productLink.getEditPoints().get(0)
-                );
-            }
-            else {
-                processLine = new Line2D.Float(
-                        absAssocPoint,
-                        finalEndPoint
-                );
-            }
-
-            // finally set up the xml elements and add to reactions
-            int num0 = localEditPoints0.size();
-            int num1 = localEditPoints1.size();
-            int num2 = localEditPoints2.size();
-            List<Integer> segmentCountList = Arrays.asList(num0+1, num1+1, num2+1);
-
-            ConnectScheme connectScheme = getBranchConnectScheme(segmentCountList);
-
-            Line line = new Line();
-            line.setWidth(BigDecimal.valueOf(1));
-            line.setColor("ff000000");
-
-            List<String> editPointString = new ArrayList<>();
-            List<Point2D.Float> mergedList = new ArrayList<>();
-            mergedList.addAll(localEditPoints0);
-            mergedList.addAll(localEditPoints1);
-            mergedList.addAll(localEditPoints2);
-            mergedList.add(localAssocPoint);
-            for(Point2D.Float p: mergedList) {
-                editPointString.add(p.getX()+","+p.getY());
-            }
-
-            LineWrapper lineWrapper = new LineWrapper(connectScheme, editPointString, line);
-            lineWrapper.setNum0(num0);
-            lineWrapper.setNum1(num1);
-            lineWrapper.setNum2(num2);
-            lineWrapper.settShapeIndex(0);
+            java.util.Map<String, List<Point2D.Float>> arcsId2Editpoints = new LinkedHashMap<>();
+            arcsId2Editpoints.put(baseReactantArcs.get(0).getId(), localEditPoints0);
+            arcsId2Editpoints.put(baseReactantArcs.get(1).getId(), localEditPoints1);
+            arcsId2Editpoints.put(baseProductArcs.get(0).getId(), localEditPoints2);
+            LineWrapper lineWrapper = buildLineWrapperWithProcess(
+                    arcsId2Editpoints,
+                    processGlyph.getId(),
+                    localAssocPoint
+            );
 
             reactionW.setLineWrapper(lineWrapper);
 
         }
         else if(reactionCDClass == ReactionType.DISSOCIATION) {
-            System.out.println("DISSOCIATION REACTION");
+            ReactionFeatures reactionFeatures = new ReactionFeatures(isReversible,true, false);
 
-            // set basic variables
             ReactantWrapper baseReactantW = baseReactantsW.get(0);
-            Glyph baseReactantGlyph = baseReactantGlyphs.get(0);
-
             ReactantWrapper baseProductW1 = baseProductsW.get(0);
-            Glyph baseProductGlyph1 = baseProductGlyphs.get(0);
-
             ReactantWrapper baseProductW2 = baseProductsW.get(1);
-            Glyph baseProductGlyph2 = baseProductGlyphs.get(1);
+
+            SimpleEntry<Point2D.Float, Point2D.Float> tmpResult = getAssocDissocPoints(
+                    Arrays.asList(baseReactantW, baseProductW1, baseProductW2),
+                    processGlyph,
+                    processCoords,
+                    baseReactantArcs.get(0),
+                    false
+            );
+            Point2D.Float absDissocPoint = tmpResult.getKey();
+            Point2D.Float localDissocPoint = tmpResult.getValue();
 
 
-            // get point lists in correct order
-            // apply the mapBounds correction to each point of the arc to get consistent coords
-            List<Point2D.Float> reactantPoints = applyCorrection(SBGNUtils.getPoints(baseReactantArcs.get(0)),
-                    (float) mapBounds.getX(),(float) mapBounds.getY());
-            if(isReversible) {
-                Collections.reverse(reactantPoints);
-            }
-            Link reactantLink = new Link(reactantPoints);
-            Link productLink1 = new Link(applyCorrection(SBGNUtils.getPoints(baseProductArcs.get(0)),
-                    (float) mapBounds.getX(),(float) mapBounds.getY()));
-            Link productLink2 = new Link(applyCorrection(SBGNUtils.getPoints(baseProductArcs.get(1)),
-                    (float) mapBounds.getX(),(float) mapBounds.getY()));
+            SimpleEntry<Link, Link> tmpResultPoints = baseLinkProcessingStep1(
+                    baseReactantW, baseReactantGlyphs.get(0),
+                    baseReactantArcs.get(0), absDissocPoint, true, reactionFeatures);
+            List<Point2D.Float> localEditPoints0 = tmpResultPoints.getKey().getEditPoints();
+            Point2D.Float finalStartPoint = tmpResultPoints.getKey().getStart();
+            Link reactantLink = tmpResultPoints.getValue();
+
+            List<Point2D.Float> localEditPoints1 = baseLinkProcessingStep1(
+                    baseProductW1, baseProductGlyphs.get(0),
+                    baseProductArcs.get(0), absDissocPoint, false, reactionFeatures).getKey().getEditPoints();
+
+            List<Point2D.Float> localEditPoints2 = baseLinkProcessingStep1(
+                    baseProductW2, baseProductGlyphs.get(1),
+                    baseProductArcs.get(1), absDissocPoint, false, reactionFeatures).getKey().getEditPoints();
 
 
-            // infer best anchorpoints possible
-            Rectangle2D.Float baseRect = SBGNUtils.getRectangleFromGlyph(baseReactantGlyph);
-            baseRect.setRect(
-                    baseRect.getX() - mapBounds.getX(),
-                    baseRect.getY() - mapBounds.getY(),
-                    baseRect.getWidth(),
-                    baseRect.getHeight());
-            AnchorPoint startAnchor = inferAnchorPoint(reactantLink.getStart(), baseReactantW, baseRect);
-            baseReactantW.setAnchorPoint(startAnchor);
+            processLine = getProcessLine(reactantLink, absDissocPoint, reactionFeatures);
 
-            Rectangle2D.Float productRect1 = SBGNUtils.getRectangleFromGlyph(baseProductGlyph1);
-            productRect1.setRect(
-                    productRect1.getX() - mapBounds.getX(),
-                    productRect1.getY() - mapBounds.getY(),
-                    productRect1.getWidth(),
-                    productRect1.getHeight());
-            AnchorPoint startAnchor1 = inferAnchorPoint(productLink1.getStart(), baseProductW1, productRect1);
-            baseProductW1.setAnchorPoint(startAnchor1);
-
-            Rectangle2D.Float productRect2 = SBGNUtils.getRectangleFromGlyph(baseProductGlyph2);
-            productRect2.setRect(
-                    productRect2.getX() - mapBounds.getX(),
-                    productRect2.getY() - mapBounds.getY(),
-                    productRect2.getWidth(),
-                    productRect2.getHeight());
-            AnchorPoint endAnchor = inferAnchorPoint(productLink2.getEnd(), baseProductW2, productRect2);
-            baseProductW2.setAnchorPoint(endAnchor);
-
-
-            // compute exact final points from the inferred anchor
-            Point2D.Float finalStartPoint = getFinalpoint(
-                    baseReactantW.getAnchorPoint(),
-                    baseReactantW,
-                    baseRect);
-            Point2D.Float finalEndPoint1 = getFinalpoint(
-                    baseProductW1.getAnchorPoint(),
-                    baseProductW1,
-                    productRect1);
-            Point2D.Float finalEndPoint2 = getFinalpoint(
-                    baseProductW2.getAnchorPoint(),
-                    baseProductW2,
-                    productRect2);
-
-
-            // define association glyph absolute point
-            /*
-                If there are ports, consider dissociation to be on the 2nd port, that way all the links are
-                already pointing to it.
-                If no ports, consider the Celldesigner dissociation glyph to be on the process, and move the process
-                a bit. Not too far because it will shift all the additional links and modification links.
-              */
-            Point2D.Float absDissocPoint = null;
-            if(processGlyph.getPort().size() > 0) {
-                // we need to get the port that is on the opposite side of the reactant
-                Port oppositePort = (Port) baseReactantArcs.get(0).getTarget();
-                Port productionPort = null;
-                for(Port p: processGlyph.getPort()){
-                    if(p != oppositePort) {
-                        productionPort = p;
-                        break;
-                    }
-                }
-                absDissocPoint = new Point2D.Float(
-                        productionPort.getX() - (float) mapBounds.getX(),
-                        productionPort.getY() - (float) mapBounds.getY());
-
-            }
-            else {
-                absDissocPoint = new Point2D.Float(
-                        (float) (processCoords.getX() - mapBounds.getX()),
-                        (float) (processCoords.getY() - mapBounds.getY())
-                );
-            }
-
-            // compute dissoc glyph relative point
-            System.out.println("Coordinate system: "+baseReactantW.getCenterPoint()+" "+
-                    baseReactantW.getCenterPoint()+" "+baseProductW1.getCenterPoint());
-            Point2D.Float localDissocPoint = GeometryUtils.convertPoints(
-                    Collections.singletonList(absDissocPoint),
-                    GeometryUtils.getTransformsToLocalCoords(
-                            baseReactantW.getCenterPoint(),
-                            baseProductW1.getCenterPoint(),
-                            baseProductW2.getCenterPoint()
-                    )).get(0);
-            System.out.println("Dissoc coords: "+absDissocPoint+" -> "+localDissocPoint);
-
-
-            /*  compute branch edit points
-                reverse points for consumption because CellDesigner consider all branches to start from association
-                glyph. Don't reverse points for reversible reactions, as the production arcs already point to the right
-                direction.
-            */
-            System.out.println("Original branch 0: "+reactantLink.getAllPoints());
-            List<Point2D.Float> editpoints0 = reactantLink.getEditPoints();
-            if(!isReversible)
-                Collections.reverse(editpoints0);
-            System.out.println("Edit points 0 from assoc: "+reactantLink.getEditPoints());
-            List<Point2D.Float> localEditPoints0 = GeometryUtils.convertPoints(
-                    editpoints0,
-                    GeometryUtils.getTransformsToLocalCoords(
-                            absDissocPoint,
-                            finalStartPoint
-                    ));
-            System.out.println("Branch 0: "+reactantLink.getEditPoints()+" -> "+localEditPoints0);
-
-            List<Point2D.Float> localEditPoints1 = GeometryUtils.convertPoints(
-                    productLink1.getEditPoints(),
-                    GeometryUtils.getTransformsToLocalCoords(
-                            absDissocPoint,
-                            finalEndPoint1
-                    ));
-            System.out.println("Branch 1: "+productLink1.getEditPoints()+" -> "+localEditPoints1);
-
-            List<Point2D.Float> localEditPoints2 = GeometryUtils.convertPoints(
-                    productLink2.getEditPoints(),
-                    GeometryUtils.getTransformsToLocalCoords(
-                            absDissocPoint,
-                            finalEndPoint2
-                    ));
-            System.out.println("Branch 2: "+productLink2.getEditPoints()+" -> "+localEditPoints2);
-
-            // get segment on which CellDesigner will put process
-            if(editpoints0.size() > 0) {
-                processLine = new Line2D.Float(
-                        editpoints0.get(0),
-                        absDissocPoint
-                );
-            }
-            else {
-                processLine = new Line2D.Float(
-                        finalStartPoint,
-                        absDissocPoint
-                );
-            }
-
-
-            // finally set up the xml elements and add to reactions
-            int num0 = localEditPoints0.size();
-            int num1 = localEditPoints1.size();
-            int num2 = localEditPoints2.size();
-            List<Integer> segmentCountList = Arrays.asList(num0+1, num1+1, num2+1);
-
-            ConnectScheme connectScheme = getBranchConnectScheme(segmentCountList);
-
-            Line line = new Line();
-            line.setWidth(BigDecimal.valueOf(1));
-            line.setColor("ff000000");
-
-            List<String> editPointString = new ArrayList<>();
-            List<Point2D.Float> mergedList = new ArrayList<>();
-            mergedList.addAll(localEditPoints0);
-            mergedList.addAll(localEditPoints1);
-            mergedList.addAll(localEditPoints2);
-            mergedList.add(localDissocPoint);
-            for(Point2D.Float p: mergedList) {
-                editPointString.add(p.getX()+","+p.getY());
-            }
-
-            LineWrapper lineWrapper = new LineWrapper(connectScheme, editPointString, line);
-            lineWrapper.setNum0(num0);
-            lineWrapper.setNum1(num1);
-            lineWrapper.setNum2(num2);
-            lineWrapper.settShapeIndex(0);
+            java.util.Map<String, List<Point2D.Float>> arcsId2Editpoints = new LinkedHashMap<>();
+            arcsId2Editpoints.put(baseReactantArcs.get(0).getId(), localEditPoints0);
+            arcsId2Editpoints.put(baseProductArcs.get(0).getId(), localEditPoints1);
+            arcsId2Editpoints.put(baseProductArcs.get(1).getId(), localEditPoints2);
+            LineWrapper lineWrapper = buildLineWrapperWithProcess(
+                    arcsId2Editpoints,
+                    processGlyph.getId(),
+                    localDissocPoint
+            );
 
             reactionW.setLineWrapper(lineWrapper);
 
@@ -686,7 +610,6 @@ public class SBGNML2CD extends GeneralConverter {
             // TODO what if both go the center of the process ?
             List<Point2D.Float> completeLinkPoints = new ArrayList<>(reactantPoints);
             completeLinkPoints.addAll(productPoints);
-            System.out.println("Base link points: "+completeLinkPoints);
 
             // gather only edit points, as they are the one who will undergo transformations into local
             // coordinate system
@@ -730,7 +653,6 @@ public class SBGNML2CD extends GeneralConverter {
                             finalStartPoint,
                             finalEndPoint
                     ));
-            System.out.println("Local edit points "+localEditPoints);
 
             // get segment on which CellDesigner will put process
             if(editPointsOnly.size() > 0) {
@@ -746,41 +668,33 @@ public class SBGNML2CD extends GeneralConverter {
                 );
             }
 
-
             /*
                 Finally build the appropriate xml elements and pass it to the reaction
              */
-
-            int segmentCount = completeLinkPoints.size() - 1;
             int processSegmentIndex = reactantPoints.size() - 1;
 
-            ConnectScheme connectScheme = getSimpleConnectScheme(segmentCount, processSegmentIndex);
-
-            Line line = new Line();
-            line.setWidth(BigDecimal.valueOf(1));
-            line.setColor("ff000000");
-
-            List<String> editPointString = new ArrayList<>();
-            for(Point2D.Float p: localEditPoints) {
-                editPointString.add(p.getX()+","+p.getY());
-            }
-
-            LineWrapper lineWrapper = new LineWrapper(connectScheme, editPointString, line);
+            java.util.Map<String, List<Point2D.Float>> arcsId2Editpoints = new LinkedHashMap<>();
+            arcsId2Editpoints.put(baseReactantArcs.get(0).getId(),
+                    localEditPoints.subList(0,processSegmentIndex));
+            arcsId2Editpoints.put(baseProductArcs.get(0).getId(),
+                    localEditPoints.subList(processSegmentIndex, localEditPoints.size()));
+            LineWrapper lineWrapper = buildLineWrapperWithProcess(
+                    arcsId2Editpoints,
+                    processGlyph.getId(),
+                    null
+            );
 
             reactionW.setLineWrapper(lineWrapper);
 
         }
 
         // now that base reaction link is established, build the process model
-        System.out.println("Process is on: "+processLine.getP1()+" "+processLine.getP2());
         Process pr = new Process(
                 GeometryUtils.getMiddle((Point2D.Float) processLine.getP1(),(Point2D.Float) processLine.getP2()),
                 processGlyph.getId(),
                 processLine,
                 new StyleInfo(processGlyph.getId())
         );
-        System.out.println("anchors 0 and 1: "+pr.getAbsoluteAnchorCoords(0)+" "+pr.getAbsoluteAnchorCoords(1));
-
 
         // process additional reactants and products
         for(i=0; i < additionalReactantArcs.size(); i++) {
@@ -791,6 +705,12 @@ public class SBGNML2CD extends GeneralConverter {
             additionalW.setTargetLineIndex("-1,0");
 
             List<Point2D.Float> additionalReactPoints = SBGNUtils.getPoints(additionalArc);
+            if(processGlyph.getPort().size() > 0) {
+                additionalReactPoints.add(new Point2D.Float(
+                        processGlyph.getBbox().getX(),
+                        processGlyph.getBbox().getY())
+                );
+            }
             if(isReversible)
                 Collections.reverse(additionalReactPoints);
 
@@ -825,23 +745,8 @@ public class SBGNML2CD extends GeneralConverter {
                             finalStartPoint,
                             anchor0
                     ));
-            System.out.println("Local edit points "+localEditPoints);
 
-            int segmentCount = localEditPoints.size() + 1;
-
-            ConnectScheme connectScheme = getSimpleConnectScheme(segmentCount, -1);
-
-            LineType2 line = new LineType2();
-            line.setWidth(BigDecimal.valueOf(1));
-            line.setColor("ff000000");
-            line.setType("Straight");
-
-            List<String> editPointString = new ArrayList<>();
-            for(Point2D.Float p: localEditPoints) {
-                editPointString.add(p.getX()+","+p.getY());
-            }
-
-            LineWrapper lineWrapper = new LineWrapper(connectScheme, editPointString, line);
+            LineWrapper lineWrapper = buildLineWrapper(additionalArc.getId(), localEditPoints, null);
 
             additionalW.setLineWrapper(lineWrapper);
             reactionW.getAdditionalReactants().add(additionalW);
@@ -856,7 +761,14 @@ public class SBGNML2CD extends GeneralConverter {
 
             additionalW.setTargetLineIndex("-1,1");
 
-            List<Point2D.Float> additionalProdPoints = SBGNUtils.getPoints(additionalArc);
+            List<Point2D.Float> additionalProdPoints = new ArrayList<>();
+            if(processGlyph.getPort().size() > 0) {
+                additionalProdPoints.add(new Point2D.Float(
+                        processGlyph.getBbox().getX(),
+                        processGlyph.getBbox().getY())
+                );
+            }
+            additionalProdPoints.addAll(SBGNUtils.getPoints(additionalArc));
 
             // gather only edit points, as they are the one who will undergo transformations into local
             // coordinate system
@@ -888,23 +800,8 @@ public class SBGNML2CD extends GeneralConverter {
                             anchor1,
                             finalEndPoint
                     ));
-            System.out.println("Local edit points "+localEditPoints);
 
-            int segmentCount = localEditPoints.size() + 1;
-
-            ConnectScheme connectScheme = getSimpleConnectScheme(segmentCount, -1);
-
-            LineType2 line = new LineType2();
-            line.setWidth(BigDecimal.valueOf(1));
-            line.setColor("ff000000");
-            line.setType("Straight");
-
-            List<String> editPointString = new ArrayList<>();
-            for(Point2D.Float p: localEditPoints) {
-                editPointString.add(p.getX()+","+p.getY());
-            }
-
-            LineWrapper lineWrapper = new LineWrapper(connectScheme, editPointString, line);
+            LineWrapper lineWrapper = buildLineWrapper(additionalArc.getId(), localEditPoints, null);
 
             additionalW.setLineWrapper(lineWrapper);
             reactionW.getAdditionalProducts().add(additionalW);
@@ -916,77 +813,361 @@ public class SBGNML2CD extends GeneralConverter {
             ReactantWrapper modificationW = modificationsW.get(i);
             Glyph modificationGlyph = modificationsGlyphs.get(i);
 
-            if(modificationGlyph.getClazz().equals("and")
-                    || modificationGlyph.getClazz().equals("or")
-                    || modificationGlyph.getClazz().equals("not")) {
-                continue;
+            /*
+                If logic gate encountered, get all direct links to it. Exclude other logic gates as a complete
+                tree of logic gates is impossible in CellDesigner.
+                So get only direct links to EPNs and connect them to newly created logicWrapper.
+             */
+            if(SBGNUtils.isLogicGate(modificationGlyph)) {
+                List<Arc> arcsConnectedToLogic = glyphToArc.get(modificationGlyph.getId());
+
+                List<ReactantWrapper> connectedReactantsW = new ArrayList<>();
+                List<String> logicModifiers = new ArrayList<>();
+                List<String> logicAliases = new ArrayList<>();
+                for(Arc logicArc: arcsConnectedToLogic) {
+                    Glyph sourceGlyhp = arcToSource.get(logicArc.getId());
+                    // discard other connected logic gates, and the arc coming from the current gate itself
+                    if(SBGNUtils.isLogicGate(sourceGlyhp)) {
+                        continue;
+                    }
+
+                    AliasWrapper aliasW = aliasWrapperMap.get(sourceGlyhp.getId()+"_alias1");
+
+                    ReactantWrapper modifWrapper = new ReactantWrapper(aliasW, ReactantType.MODIFICATION);
+
+                    // modifications linked to logic gates inherit their link type
+                    modifWrapper.setModificationLinkType(
+                            ModificationLinkType.valueOf(
+                                    LinkModel.getCdClass(
+                                            ArcClazz.fromClazz(modificationArc.getClazz()))));
+
+                    ReactantWrapper processedLogicModifW = processModifierToLogic(logicArc, sourceGlyhp,
+                            modifWrapper, modificationGlyph);
+
+                    // we can't directly add the connected reactants, need the logic gate first.
+                    //reactionW.getModifiers().add(processedLogicModifW);
+                    connectedReactantsW.add(processedLogicModifW);
+                    logicModifiers.add(processedLogicModifW.getAliasW().getSpeciesW().getId());
+                    logicAliases.add(processedLogicModifW.getAliasW().getId());
+                }
+
+                // process the logic gate itself
+                ReactantWrapper processedlogicW = processLogicGate(modificationArc,
+                        modificationGlyph, modificationW, pr);
+
+                LogicGateWrapper finalLogicW = new LogicGateWrapper(
+                        processedlogicW,
+                        LogicGateWrapper.LogicGateType.valueOf(modificationGlyph.getClazz().toUpperCase()),
+                        logicModifiers,
+                        logicAliases,
+                        processedlogicW.getModificationLinkType()
+                );
+
+                orphanLogicGates.remove(modificationGlyph);
+
+                /*SpeciesWrapper logicSpW = new SpeciesWrapper(modificationGlyph.getId(),
+                        modificationGlyph.getId(), null);
+                AliasWrapper logicAliasW = new AliasWrapper(modificationGlyph.getId()+"_alias1",
+                        AliasWrapper.AliasType.SPECIES, logicSpW);
+                finalLogicW.setAliasW(logicAliasW);*/
+                finalLogicW.setAnchorPoint(AnchorPoint.CENTER);
+
+                reactionW.getModifiers().add(finalLogicW);
+                for(ReactantWrapper connectedToLogic: connectedReactantsW) {
+                    reactionW.getModifiers().add(connectedToLogic);
+                }
+
+
             }
-
-            // TODO target line index
-
-            List<Point2D.Float> modificationPoints = SBGNUtils.getPoints(modificationArc);
-
-            // gather only edit points, as they are the one who will undergo transformations into local
-            // coordinate system
-            List<Point2D.Float> editPointsOnly;
-            if(modificationPoints.size() > 2) {
-                editPointsOnly = modificationPoints.subList(1, modificationPoints.size() - 1);
-            }
+            // non logic gates modifiers
             else {
-                editPointsOnly = new ArrayList<>();
-            }
-            Point2D.Float startPoint = modificationPoints.get(0);
-            Point2D.Float endPoint = modificationPoints.get(modificationPoints.size() - 1);
-
-            // infer best anchorpoints possible
-            System.out.println(modificationArc.getId());
-            AnchorPoint startAnchor = inferAnchorPoint(startPoint, modificationW,
-                    SBGNUtils.getRectangleFromGlyph(modificationGlyph));
-            modificationW.setAnchorPoint(startAnchor);
-
-            int processAnchor = inferProcessAnchorPoint(endPoint, pr);
-            modificationW.setTargetLineIndex("-1,"+processAnchor);
-
-
-            Point2D.Float finalStartPoint = getFinalpoint(
-                    modificationW.getAnchorPoint(),
-                    modificationW,
-                    SBGNUtils.getRectangleFromGlyph(modificationGlyph));
-            Point2D.Float finalEndPoint = pr.getAbsoluteAnchorCoords(processAnchor);
-
-            List<Point2D.Float> localEditPoints = GeometryUtils.convertPoints(
-                    editPointsOnly,
-                    GeometryUtils.getTransformsToLocalCoords(
-                            finalStartPoint,
-                            finalEndPoint
-                    ));
-            System.out.println("Local edit points "+localEditPoints);
-
-
-            int segmentCount = localEditPoints.size() + 1;
-
-            ConnectScheme connectScheme = getSimpleConnectScheme(segmentCount, -1);
-
-            LineType2 line = new LineType2();
-            line.setWidth(BigDecimal.valueOf(1));
-            line.setColor("ff000000");
-            line.setType("Straight");
-
-            List<String> editPointString = new ArrayList<>();
-            for(Point2D.Float p: localEditPoints) {
-                editPointString.add(p.getX()+","+p.getY());
+                ReactantWrapper processedModifW = processModifier(modificationArc,
+                        modificationGlyph, modificationW, pr);
+                reactionW.getModifiers().add(processedModifW);
             }
 
-            LineWrapper lineWrapper = new LineWrapper(connectScheme, editPointString, line);
+            // get all speciesReference and add the reaction to those species as catalyzedReaction
+            for(ModifierSpeciesReference speciesReference:
+                    reactionW.getCDReaction().getListOfModifiers().getModifierSpeciesReference()) {
+                String speciesId = speciesReference.getSpecies();
+                SpeciesWrapper speciesW = speciesWrapperMap.get(speciesId);
 
-            modificationW.setLineWrapper(lineWrapper);
-            reactionW.getModifiers().add(modificationW);
-
+                speciesW.getCatalyzedReactions().add(reactionW.getId());
+            }
 
         }
 
+        setNotes(reactionW, processGlyph);
+        setAnnotations(reactionW, processGlyph);
+
         sbml.getModel().getListOfReactions().getReaction().add(reactionW.getCDReaction());
 
+    }
+
+    private void processOrphanArc(Arc orphanArc) {
+        // process orphan arcs
+        Glyph targetGlyph = arcToTarget.get(orphanArc.getId());
+        Glyph sourceGlyph = arcToSource.get(orphanArc.getId());
+
+        AliasWrapper sourceAliasW = aliasWrapperMap.get(sourceGlyph.getId()+"_alias1");
+        AliasWrapper targetAliasW = aliasWrapperMap.get(targetGlyph.getId()+"_alias1");
+
+        // case where one of the glyphs could not be translated (ex: submaps)
+        if(sourceAliasW == null || targetAliasW == null) {
+            logger.warn("Discarding arc because its source or target could not be translated"); // TODO more details
+            return;
+        }
+
+        ReactantWrapper sourceWrapper = new ReactantWrapper(sourceAliasW, ReactantType.BASE_REACTANT);
+        ReactantWrapper targetWrapper = new ReactantWrapper(targetAliasW, ReactantType.BASE_PRODUCT);
+
+        List<Point2D.Float> arcPoints = SBGNUtils.getPoints(orphanArc);
+
+        // gather only edit points, as they are the one who will undergo transformations into local
+        // coordinate system
+        List<Point2D.Float> editPointsOnly;
+        if(arcPoints.size() > 2) {
+            editPointsOnly = arcPoints.subList(1, arcPoints.size() - 1);
+        }
+        else {
+            editPointsOnly = new ArrayList<>();
+        }
+        Point2D.Float startPoint = arcPoints.get(0);
+        Point2D.Float endPoint = arcPoints.get(arcPoints.size() - 1);
+
+        // infer best anchorpoints possible
+        AnchorPoint startAnchor = inferAnchorPoint(startPoint, sourceWrapper,
+                SBGNUtils.getRectangleFromGlyph(sourceGlyph));
+        sourceWrapper.setAnchorPoint(startAnchor);
+
+        AnchorPoint endAnchor = inferAnchorPoint(endPoint, targetWrapper,
+                SBGNUtils.getRectangleFromGlyph(targetGlyph));
+        targetWrapper.setAnchorPoint(endAnchor);
+
+        Point2D.Float finalStartPoint = getFinalpoint(
+                sourceWrapper.getAnchorPoint(),
+                sourceWrapper,
+                SBGNUtils.getRectangleFromGlyph(sourceGlyph));
+        Point2D.Float finalEndPoint = getFinalpoint(
+                targetWrapper.getAnchorPoint(),
+                targetWrapper,
+                SBGNUtils.getRectangleFromGlyph(targetGlyph));
+
+
+        List<Point2D.Float> localEditPoints = GeometryUtils.convertPoints(
+                editPointsOnly,
+                GeometryUtils.getTransformsToLocalCoords(
+                        finalStartPoint,
+                        finalEndPoint
+                ));
+
+        LineWrapper lineWrapper = buildLineWrapper(orphanArc.getId(), localEditPoints, null);
+
+        ReactionWrapper reactionW = new ReactionWrapper(
+                orphanArc.getId(),
+                ReactionType.valueOf(LinkModel.getReducedCdClass(ArcClazz.fromClazz(orphanArc.getClazz()))),
+                Collections.singletonList(sourceWrapper),
+                Collections.singletonList(targetWrapper));
+
+        reactionW.setLineWrapper(lineWrapper);
+        reactionW.setHasProcess(false);
+
+        sbml.getModel().getListOfReactions().getReaction().add(reactionW.getCDReaction());
+
+        /*additionalW.setLineWrapper(lineWrapper);
+        reactionW.getAdditionalProducts().add(additionalW);*/
+    }
+
+    private ReactantWrapper processModifierToLogic(Arc modificationArc, Glyph modificationGlyph,
+                                            ReactantWrapper modificationW, Glyph logicGateGlyph) {
+        List<Point2D.Float> modificationPoints = SBGNUtils.getPoints(modificationArc);
+        if(logicGateGlyph.getPort().size() > 0) {
+            modificationPoints.add(new Point2D.Float(
+                    //modificationGlyph.getBbox().getX() - (float) mapBounds.getX() + modificationGlyph.getBbox().getW() / 2,
+                    //modificationGlyph.getBbox().getY() - (float) mapBounds.getY() + modificationGlyph.getBbox().getH() / 2
+                    logicGateGlyph.getBbox().getX() + logicGateGlyph.getBbox().getW() / 2,
+                    logicGateGlyph.getBbox().getY() + logicGateGlyph.getBbox().getH() / 2
+            ));
+        }
+
+        // gather only edit points, as they are the one who will undergo transformations into local
+        // coordinate system
+        List<Point2D.Float> editPointsOnly;
+        if(modificationPoints.size() > 2) {
+            editPointsOnly = modificationPoints.subList(1, modificationPoints.size() - 1);
+        }
+        else {
+            editPointsOnly = new ArrayList<>();
+        }
+        Point2D.Float startPoint = modificationPoints.get(0);
+        Point2D.Float endPoint = modificationPoints.get(modificationPoints.size() - 1);
+
+        // infer best anchorpoints possible
+        if(!SBGNUtils.isLogicGate(modificationGlyph)) {
+            AnchorPoint startAnchor = inferAnchorPoint(startPoint, modificationW,
+                    SBGNUtils.getRectangleFromGlyph(modificationGlyph));
+            modificationW.setAnchorPoint(startAnchor);
+        }
+
+        Point2D.Float finalEndPoint = endPoint;
+
+        modificationW.setTargetLineIndex("-1,0");
+
+        Point2D.Float finalStartPoint = getFinalpoint(
+                modificationW.getAnchorPoint(),
+                modificationW,
+                SBGNUtils.getRectangleFromGlyph(modificationGlyph));
+
+
+        List<Point2D.Float> localEditPoints = GeometryUtils.convertPoints(
+                editPointsOnly,
+                GeometryUtils.getTransformsToLocalCoords(
+                        finalStartPoint,
+                        finalEndPoint
+                ));
+
+        LineWrapper lineWrapper = buildLineWrapper(modificationArc.getId(), localEditPoints, null);
+
+        modificationW.setLineWrapper(lineWrapper);
+        return modificationW;
+    }
+
+    private ReactantWrapper processLogicGate(Arc modificationArc, Glyph modificationGlyph,
+                                            ReactantWrapper modificationW, Process pr) {
+
+        List<Point2D.Float> modificationPoints = new ArrayList<>();
+        if(modificationGlyph.getPort().size() > 0) {
+            // join the arc coming out of the port to the center of the logic gate
+            modificationPoints.add(new Point2D.Float(
+                    //modificationGlyph.getBbox().getX() - (float) mapBounds.getX() + modificationGlyph.getBbox().getW() / 2,
+                    //modificationGlyph.getBbox().getY() - (float) mapBounds.getY() + modificationGlyph.getBbox().getH() / 2
+                    modificationGlyph.getBbox().getX() + modificationGlyph.getBbox().getW() / 2,
+                    modificationGlyph.getBbox().getY() + modificationGlyph.getBbox().getH() / 2
+            ));
+        }
+        modificationPoints.addAll(SBGNUtils.getPoints(modificationArc));
+
+        // gather only edit points, as they are the one who will undergo transformations into local
+        // coordinate system
+        List<Point2D.Float> editPointsOnly;
+        if(modificationPoints.size() > 2) {
+            editPointsOnly = modificationPoints.subList(1, modificationPoints.size() - 1);
+        }
+        else {
+            editPointsOnly = new ArrayList<>();
+        }
+        Point2D.Float startPoint = modificationPoints.get(0);
+        Point2D.Float endPoint = modificationPoints.get(modificationPoints.size() - 1);
+
+        // infer best anchorpoints possible
+        int processAnchor = inferProcessAnchorPoint(endPoint, pr);
+        modificationW.setTargetLineIndex("-1," + processAnchor);
+
+        Point2D.Float finalEndPoint = pr.getAbsoluteAnchorCoords(processAnchor);
+
+        // for logic gates, just take the center of the glyph
+        Point2D.Float finalStartPoint = startPoint;
+
+        List<Point2D.Float> localEditPoints = GeometryUtils.convertPoints(
+                editPointsOnly,
+                GeometryUtils.getTransformsToLocalCoords(
+                        finalStartPoint,
+                        finalEndPoint
+                ));
+
+        // logic gates have their own coordinate added to the edit point, in global coord system
+        // we need to adjust to map translation factor
+        Point2D.Float logicPoint = new Point2D.Float(
+                (float) (finalStartPoint.getX() - mapBounds.getX()),
+                (float) (finalStartPoint.getY() - mapBounds.getY()));
+
+        LineWrapper lineWrapper = buildLineWrapper(modificationArc.getId(), localEditPoints, logicPoint);
+
+        modificationW.setLineWrapper(lineWrapper);
+        return modificationW;
+    }
+
+    /**
+     * Pass a Point2D for logic gates, process otherwise
+     * @param modificationArc
+     * @param modificationGlyph
+     * @param modificationW
+     * @param prOrLogic
+     * @return
+     */
+    private ReactantWrapper processModifier(Arc modificationArc, Glyph modificationGlyph,
+                                 ReactantWrapper modificationW, Object prOrLogic) {
+        List<Point2D.Float> modificationPoints = SBGNUtils.getPoints(modificationArc);
+
+        // gather only edit points, as they are the one who will undergo transformations into local
+        // coordinate system
+        List<Point2D.Float> editPointsOnly;
+        if(modificationPoints.size() > 2) {
+            editPointsOnly = modificationPoints.subList(1, modificationPoints.size() - 1);
+        }
+        else {
+            editPointsOnly = new ArrayList<>();
+        }
+        Point2D.Float startPoint = modificationPoints.get(0);
+        Point2D.Float endPoint = modificationPoints.get(modificationPoints.size() - 1);
+
+        // infer best anchorpoints possible
+        if(!SBGNUtils.isLogicGate(modificationGlyph)) {
+            AnchorPoint startAnchor = inferAnchorPoint(startPoint, modificationW,
+                    SBGNUtils.getRectangleFromGlyph(modificationGlyph));
+            modificationW.setAnchorPoint(startAnchor);
+        }
+
+        Point2D.Float finalEndPoint = null;
+        if(prOrLogic instanceof Process) {
+            Process pr = (Process) prOrLogic;
+            int processAnchor = inferProcessAnchorPoint(endPoint, pr);
+            modificationW.setTargetLineIndex("-1," + processAnchor);
+
+            finalEndPoint = pr.getAbsoluteAnchorCoords(processAnchor);
+        }
+        else if(prOrLogic instanceof Point2D) {
+            finalEndPoint = (Point2D.Float) prOrLogic;
+            modificationW.setTargetLineIndex("-1,0");
+        }
+
+        Point2D.Float finalStartPoint  = null;
+        if(SBGNUtils.isLogicGate(modificationGlyph)) {
+            // for logic gates, just take the center of the glyph
+            finalStartPoint = new Point2D.Float(
+                    (float) (modificationGlyph.getBbox().getX() - mapBounds.getX() + modificationGlyph.getBbox().getW() / 2),
+                    (float) (modificationGlyph.getBbox().getY() - mapBounds.getY() + modificationGlyph.getBbox().getH() / 2)
+            );
+        }
+        else {
+            finalStartPoint = getFinalpoint(
+                    modificationW.getAnchorPoint(),
+                    modificationW,
+                    SBGNUtils.getRectangleFromGlyph(modificationGlyph));
+        }
+
+
+        List<Point2D.Float> localEditPoints = GeometryUtils.convertPoints(
+                editPointsOnly,
+                GeometryUtils.getTransformsToLocalCoords(
+                        finalStartPoint,
+                        finalEndPoint
+                ));
+
+        LineWrapper lineWrapper;
+        // logic gates have their own coordinate added to the edit point, in global coord system
+        if(SBGNUtils.isLogicGate(modificationGlyph)) {
+            Point2D.Float logicPoint = new Point2D.Float(
+                    (float) finalStartPoint.getX(),
+                    (float) finalStartPoint.getY());
+            lineWrapper = buildLineWrapper(modificationArc.getId(), localEditPoints, logicPoint);
+        }
+        else {
+            lineWrapper = buildLineWrapper(modificationArc.getId(), localEditPoints, null);
+        }
+
+        modificationW.setLineWrapper(lineWrapper);
+        return modificationW;
     }
 
     /**
@@ -1038,8 +1219,11 @@ public class SBGNML2CD extends GeneralConverter {
     private void processSpecies(Glyph glyph, boolean isIncluded, boolean isComplex,
                                 String parentSpeciesId, String parentAliasId) {
         String label = glyph.getLabel() == null ? "": glyph.getLabel().getText();
+        label = Utils.UTF8charsToCD(label);
+        List<Glyph> unitOfInfoList = glyph.getGlyph().stream()
+                .filter(g->GlyphClazz.fromClazz(g.getClazz()) == UNIT_OF_INFORMATION)
+                .collect(Collectors.toList());
 
-        System.out.println(glyph.getClazz()+" "+isIncluded+" "+isComplex);
         // first determine specific subtypes
         SpeciesWrapper.ReferenceType subType = null;
         boolean ionFlag = false;
@@ -1049,36 +1233,113 @@ public class SBGNML2CD extends GeneralConverter {
                 case MACROMOLECULE:
                 case MACROMOLECULE_MULTIMER:
                     subType = SpeciesWrapper.ReferenceType.GENERIC; // default
-                    if(SBGNUtils.hasUnitOfInfo(glyph, "receptor")) {
+
+                    Optional<Glyph> g = SBGNUtils.getUnitOfInfo(glyph, "receptor");
+                    if(g.isPresent()) {
                         subType = SpeciesWrapper.ReferenceType.RECEPTOR;
+                        unitOfInfoList.remove(g.get());
                     }
-                    if(SBGNUtils.hasUnitOfInfo(glyph, "ion channel")) {
+                    g = SBGNUtils.getUnitOfInfo(glyph, "ion channel");
+                    if(g.isPresent()) {
                         subType = SpeciesWrapper.ReferenceType.ION_CHANNEL;
+                        unitOfInfoList.remove(g.get());
                     }
-                    if(SBGNUtils.hasUnitOfInfo(glyph, "truncated")) {
+                    g = SBGNUtils.getUnitOfInfo(glyph, "truncated");
+                    if(g.isPresent()) {
                         subType = SpeciesWrapper.ReferenceType.TRUNCATED;
+                        unitOfInfoList.remove(g.get());
                     }
                     break;
                 case NUCLEIC_ACID_FEATURE:
                 case NUCLEIC_ACID_FEATURE_MULTIMER:
                     subType = SpeciesWrapper.ReferenceType.GENE; // default
-                    if(SBGNUtils.hasUnitOfInfo(glyph, "rna")) {
+                    g = SBGNUtils.getUnitOfInfo(glyph, "rna");
+                    if(g.isPresent()) {
                         subType = SpeciesWrapper.ReferenceType.RNA;
+                        unitOfInfoList.remove(g.get());
                     }
-                    if(SBGNUtils.hasUnitOfInfo(glyph, "asrna")) {
+                    g = SBGNUtils.getUnitOfInfo(glyph, "asrna");
+                    if(g.isPresent()) {
                         subType = SpeciesWrapper.ReferenceType.ANTISENSE_RNA;
+                        unitOfInfoList.remove(g.get());
                     }
                     break;
                 case SIMPLE_CHEMICAL:
                 case SIMPLE_CHEMICAL_MULTIMER:
-                    if(SBGNUtils.hasUnitOfInfo(glyph, "ion")) {
+                    g = SBGNUtils.getUnitOfInfo(glyph, "ion");
+                    if(g.isPresent()) {
                         ionFlag = true;
+                        unitOfInfoList.remove(g.get());
                     }
-                    if(SBGNUtils.hasUnitOfInfo(glyph, "drug")) {
+                    g = SBGNUtils.getUnitOfInfo(glyph, "drug");
+                    if(g.isPresent()) {
                         drugFlag = true;
+                        unitOfInfoList.remove(g.get());
                     }
                     break;
             }
+        }
+
+        // process state vars
+        List<ResidueWrapper> residueList = new ArrayList<>();
+        int i=0;
+        for(Glyph stateVar: SBGNUtils.getStateVariables(glyph)) {
+            double angle = GeometryUtils.getAngleOfAuxUnit(
+                    SBGNUtils.getRectangleFromGlyph(glyph),
+                    SBGNUtils.getRectangleFromGlyph(stateVar));
+            double topRatio = GeometryUtils.getTopRatioOfAuxUnit(
+                    SBGNUtils.getRectangleFromGlyph(glyph),
+                    SBGNUtils.getRectangleFromGlyph(stateVar));
+
+            String variable = stateVar.getState().getVariable();
+            String value = stateVar.getState().getValue();
+
+            ResidueWrapper resW = new ResidueWrapper("rs"+i);
+            //resW.useAngle = true;
+            resW.name = variable;
+            resW.state = ResidueWrapper.getLongState(value);
+            resW.angle = (float) angle;
+            resW.relativePos = (float) topRatio;
+            residueList.add(resW);
+
+            i++;
+
+        }
+
+        // process unit of info
+        // certain values are allowed by CellDesigner. Other things are considered free input.
+        HashSet<String> recognizedInfo = new HashSet<>(Arrays.asList(
+                "pc:T", "pc:V", "pc:pH",
+                "mt:ion", "mt:rad", "mt:rna", "mt:dna", "mt:prot", "mt:psac",
+                "ct:gene", "ct:tss","ct:coding","ct:grr","ct:mRNA"
+                )); // also N:\d+
+
+        List<AliasInfoWrapper> infoWrapperList = new ArrayList<>();
+        for(Glyph infoUnit: unitOfInfoList) {
+            // !! beware angle direction is inversed for units of info...
+            double angle = -GeometryUtils.getAngleOfAuxUnit(
+                    SBGNUtils.getRectangleFromGlyph(glyph),
+                    SBGNUtils.getRectangleFromGlyph(infoUnit));
+
+            String value = infoUnit.getLabel().getText();
+            String prefix;
+            String infoLabel;
+            if(recognizedInfo.contains(value) || value.startsWith("N:")) {
+                String[] tmp = value.split(":");
+                prefix = tmp[0];
+                infoLabel = tmp[1];
+            }
+            else {
+                prefix = "free input";
+                infoLabel = value;
+            }
+
+            AliasInfoWrapper infoWrapper = new AliasInfoWrapper(
+                    (float) angle,
+                    prefix,
+                    infoLabel);
+
+            infoWrapperList.add(infoWrapper);
         }
 
         // create associated reference type (protein, gene...)
@@ -1095,7 +1356,26 @@ public class SBGNML2CD extends GeneralConverter {
                     referenceId = "prot_"+glyph.getId();
                     prot.setId(referenceId);
                     prot.setName(label);
-                    sbml.getModel().getAnnotation().getExtension().getListOfProteins().getProtein().add(prot);
+
+                    if(residueList.size() > 0) {
+                        ListOfModificationResidues listOfModificationResidues = new ListOfModificationResidues();
+                        prot.setListOfModificationResidues(listOfModificationResidues);
+
+                        for(ResidueWrapper resW: residueList) {
+                            ModificationResidue modificationResidue = new ModificationResidue();
+                            listOfModificationResidues.getModificationResidue().add(modificationResidue);
+
+                            modificationResidue.setSide("none");
+                            modificationResidue.setAngle(BigDecimal.valueOf(resW.angle));
+                            modificationResidue.setId(resW.id);
+                            if(resW.name != null && !resW.name.isEmpty()) {
+                                modificationResidue.setName(resW.name);
+                            }
+                        }
+                    }
+
+                    protMap.put(referenceId, prot);
+                    //sbml.getModel().getAnnotation().getExtension().getListOfProteins().getProtein().add(prot);
                     break;
                 case GENE:
                     Gene gene = new Gene();
@@ -1103,7 +1383,29 @@ public class SBGNML2CD extends GeneralConverter {
                     gene.setId(referenceId);
                     gene.setName(label);
                     gene.setType("GENE");
-                    sbml.getModel().getAnnotation().getExtension().getListOfGenes().getGene().add(gene);
+
+                    if(residueList.size() > 0) {
+                        ListOfRegions listOfRegions = new ListOfRegions();
+                        gene.setListOfRegions(listOfRegions);
+
+                        for(ResidueWrapper resW: residueList) {
+                            ListOfRegions.Region region = new ListOfRegions.Region();
+                            listOfRegions.getRegion().add(region);
+
+                            region.setId(resW.id);
+                            region.setActive(false);
+                            region.setSize(BigDecimal.valueOf(0));
+                            region.setType("Modification Site");
+                            region.setPos(BigDecimal.valueOf(resW.relativePos));
+
+                            if(resW.name != null && !resW.name.isEmpty()) {
+                                region.setName(resW.name);
+                            }
+                        }
+                    }
+
+                    geneMap.put(referenceId, gene);
+                    //sbml.getModel().getAnnotation().getExtension().getListOfGenes().getGene().add(gene);
                     break;
                 case RNA:
                     RNA rna = new RNA();
@@ -1111,7 +1413,30 @@ public class SBGNML2CD extends GeneralConverter {
                     rna.setId(referenceId);
                     rna.setName(label);
                     rna.setType("RNA");
-                    sbml.getModel().getAnnotation().getExtension().getListOfRNAs().getRNA().add(rna);
+
+                    if(residueList.size() > 0) {
+                        ListOfRegions listOfRegions = new ListOfRegions();
+                        rna.setListOfRegions(listOfRegions);
+
+                        for(ResidueWrapper resW: residueList) {
+                            ListOfRegions.Region region = new ListOfRegions.Region();
+                            listOfRegions.getRegion().add(region);
+
+                            region.setId(resW.id);
+                            // region.setActive(false); // <--- same as genes except no activity
+                            region.setSize(BigDecimal.valueOf(0));
+                            region.setType("Modification Site");
+                            region.setPos(BigDecimal.valueOf(resW.relativePos));
+
+                            if(resW.name != null && !resW.name.isEmpty()) {
+                                region.setName(resW.name);
+                            }
+                        }
+                    }
+
+
+                    rnaMap.put(referenceId, rna);
+                    //sbml.getModel().getAnnotation().getExtension().getListOfRNAs().getRNA().add(rna);
                     break;
                 case ANTISENSE_RNA:
                     AntisenseRNA asrna = new AntisenseRNA();
@@ -1119,7 +1444,29 @@ public class SBGNML2CD extends GeneralConverter {
                     asrna.setId(referenceId);
                     asrna.setName(label);
                     asrna.setType("ANTISENSE_RNA");
-                    sbml.getModel().getAnnotation().getExtension().getListOfAntisenseRNAs().getAntisenseRNA().add(asrna);
+
+                    if(residueList.size() > 0) {
+                        ListOfRegions listOfRegions = new ListOfRegions();
+                        asrna.setListOfRegions(listOfRegions);
+
+                        for(ResidueWrapper resW: residueList) {
+                            ListOfRegions.Region region = new ListOfRegions.Region();
+                            listOfRegions.getRegion().add(region);
+
+                            region.setId(resW.id);
+                            // region.setActive(false); // <--- same as genes except no activity
+                            region.setSize(BigDecimal.valueOf(0));
+                            region.setType("Modification Site");
+                            region.setPos(BigDecimal.valueOf(resW.relativePos));
+
+                            if(resW.name != null && !resW.name.isEmpty()) {
+                                region.setName(resW.name);
+                            }
+                        }
+                    }
+
+                    asrnaMap.put(referenceId, asrna);
+                    //sbml.getModel().getAnnotation().getExtension().getListOfAntisenseRNAs().getAntisenseRNA().add(asrna);
                     break;
             }
         }
@@ -1129,14 +1476,24 @@ public class SBGNML2CD extends GeneralConverter {
         String aliasId = glyph.getId()+"_alias1";
         AliasWrapper aliasW;
         if(isComplex) {
-            speciesW = new SpeciesWrapper(glyph.getId(), label, null);
+            speciesW = new SpeciesWrapper(glyph.getId(), label, null, referenceId);
             aliasW = new AliasWrapper(aliasId, AliasWrapper.AliasType.COMPLEX, speciesW);
         }
         else {
-            speciesW = new SpeciesWrapper(glyph.getId(), label, subType);
-            aliasW = new AliasWrapper(aliasId, AliasWrapper.AliasType.BASIC, speciesW);
+            speciesW = new SpeciesWrapper(glyph.getId(), label, subType, referenceId);
+            aliasW = new AliasWrapper(aliasId, AliasWrapper.AliasType.SPECIES, speciesW);
         }
         speciesW.getAliases().add(aliasW);
+
+        // find and set the toplevel complex parent
+        if(isIncluded) {
+            AliasWrapper parentComplexAliasW = aliasWrapperMap.get(parentAliasId);
+            // we need to go up the chain in case of multiple inclusion levels
+            while(parentComplexAliasW.getTopLevelParent() != null) {
+                parentComplexAliasW = parentComplexAliasW.getTopLevelParent();
+            }
+            aliasW.setTopLevelParent(parentComplexAliasW);
+        }
 
 
         // PROCESS SPECIES
@@ -1148,9 +1505,14 @@ public class SBGNML2CD extends GeneralConverter {
             speciesW.setCdClass("DRUG");
         }
         else {
-            speciesW.setCdClass(ReactantModel.getCdClass(glyph.getClazz(), subType));
+            try {
+                speciesW.setCdClass(ReactantModel.getCdClass(glyph.getClazz(), subType));
+            }
+            catch (Exception e) {
+                logger.error(e.getMessage()+" Glyph will be skipped and will not appear in translation.");
+                return;
+            }
         }
-        System.out.println("cd clazz: "+speciesW.getCdClass());
 
         // compartmentRef
         if(glyph.getCompartmentRef() != null) {
@@ -1160,16 +1522,31 @@ public class SBGNML2CD extends GeneralConverter {
             speciesW.setCompartment("default");
         }
 
+        // multimer
+        if(glyph.getClazz().endsWith("multimer")) {
+            speciesW.setMultimer(2); // default to 2, if more information is present, count will be more precise
+        }
+
+        // we allow elements to not be multimer, but still have a N:\d unit of info
+        int multimerCount = SBGNUtils.getMultimerFromInfo(glyph);
+        if(multimerCount > 0) {
+            speciesW.setMultimer(multimerCount);
+        }
+
+        // add state variables
+        for(ResidueWrapper resW: residueList) {
+            speciesW.getResidues().add(resW);
+        }
+
+        setNotes(speciesW, glyph);
+        setAnnotations(speciesW, glyph);
+
         // add species to correct list
         if(isIncluded) {
             speciesW.setComplex(parentSpeciesId);
-            org.sbml._2001.ns.celldesigner.Species species = speciesW.getCDIncludedSpecies(referenceId);
-            sbml.getModel().getAnnotation().getExtension().getListOfIncludedSpecies().getSpecies().add(species);
+            speciesW.setIncludedSpecies(true);
         }
-        else {
-            Species species = speciesW.getCDNormalSpecies(referenceId);
-            sbml.getModel().getListOfSpecies().getSpecies().add(species);
-        }
+        speciesWrapperMap.put(speciesW.getId(), speciesW);
 
         // PROCESS ALIAS
         // compartmentRef
@@ -1177,11 +1554,12 @@ public class SBGNML2CD extends GeneralConverter {
             aliasW.setCompartmentAlias(((Glyph) glyph.getCompartmentRef()).getId()+"_alias1"); // TODO get alias id properly
         }
 
-        Bounds bounds = new Bounds();
-        bounds.setX(BigDecimal.valueOf(glyph.getBbox().getX()- (float) mapBounds.getX()));
-        bounds.setY(BigDecimal.valueOf(glyph.getBbox().getY()- (float) mapBounds.getY()));
-        bounds.setW(BigDecimal.valueOf(glyph.getBbox().getW()));
-        bounds.setH(BigDecimal.valueOf(glyph.getBbox().getH()));
+        Rectangle2D.Float bounds = new Rectangle2D.Float();
+        bounds.setRect(
+                glyph.getBbox().getX()- (float) mapBounds.getX(),
+                glyph.getBbox().getY()- (float) mapBounds.getY(),
+                glyph.getBbox().getW(),
+                glyph.getBbox().getH());
         aliasW.setBounds(bounds);
 
         // style
@@ -1192,6 +1570,22 @@ public class SBGNML2CD extends GeneralConverter {
 
         if(isIncluded) {
             aliasW.setComplexAlias(parentAliasId);
+        }
+
+        // unit of info management
+        // CellDesigner only allows 1 unit of information, this can lead to loss of info
+        // only consider the first remaining info unit, output errors about the others
+        if(infoWrapperList.size() > 0) {
+            aliasW.setInfo(infoWrapperList.get(0));
+
+            if(infoWrapperList.size() > 1) {
+                for(int j=1; i < unitOfInfoList.size(); i++) {
+                    Glyph discardedUnit = unitOfInfoList.get(j);
+                    logger.error("Unit of information with id: "+discardedUnit.getId()+" and content: "
+                            +discardedUnit.getLabel().getText()+" on glyph with id: "+ glyph.getId()+" cannot be" +
+                            "translated and will be lost.");
+                }
+            }
         }
 
         // add alias to correct list
@@ -1255,24 +1649,8 @@ public class SBGNML2CD extends GeneralConverter {
             compM.setNamePoint(namePoint);
         }
 
-        // notes
-        if(glyph.getNotes() != null
-                && glyph.getNotes().getAny().size() > 0) {
-            Element notes = glyph.getNotes().getAny().get(0);
-            compM.setNotes(notes);
-        }
-
-        // rdf annotations
-        if(glyph.getExtension() != null) {
-            for(Element e: glyph.getExtension().getAny()){
-                if(e.getTagName().equals("annotation")) {
-                    // TODO urn:miriam:CHEBI:12 doesn't seem to be loaded by CD
-                    // TODO find a way to resolve uri ?
-                    Element rdf = SBGNUtils.sanitizeRdfURNs((Element) e.getElementsByTagName("rdf:RDF").item(0));
-                    compM.setAnnotations(rdf);
-                }
-            }
-        }
+        setNotes(compM, glyph);
+        setAnnotations(compM, glyph);
 
         sbml.getModel().getListOfCompartments().getCompartment()
                 .add(compM.getCDCompartment());
@@ -1313,8 +1691,7 @@ public class SBGNML2CD extends GeneralConverter {
         ext.setListOfComplexSpeciesAliases(new ListOfComplexSpeciesAliases());
         ext.setListOfGenes(new ListOfGenes());
         ext.setListOfGroups(new ListOfGroups());
-        ext.setListOfIncludedSpecies(new ListOfIncludedSpecies());
-        ext.setListOfLayers(new ListOfLayers());
+        //ext.setListOfLayers(new ListOfLayers()); // TODO only when a layer is there
         ext.setListOfProteins(new ListOfProteins());
         ext.setListOfRNAs(new ListOfRNAs());
 
@@ -1383,6 +1760,14 @@ public class SBGNML2CD extends GeneralConverter {
         processToArcs = new HashMap<>();
         portToGlyph = new HashMap<>();
         aliasWrapperMap = new HashMap<>();
+        speciesWrapperMap = new HashMap<>();
+        glyphToArc = new HashMap<>();
+        orphanArcs = new ArrayList<>();
+        orphanLogicGates = new HashSet<>();
+        protMap = new HashMap<>();
+        rnaMap = new HashMap<>();
+        geneMap = new HashMap<>();
+        asrnaMap = new HashMap<>();
 
         // parse all the style info
         styleMap = new HashMap<>();
@@ -1396,6 +1781,7 @@ public class SBGNML2CD extends GeneralConverter {
             }
         }
 
+        java.util.Map<String, Glyph> terminalId2Submap = new HashMap<>();
         for(Glyph g: map.getGlyph()) {
             GlyphClazz clazz = GlyphClazz.fromClazz(g.getClazz());
             idToGlyph.put(g.getId(), g);
@@ -1406,39 +1792,401 @@ public class SBGNML2CD extends GeneralConverter {
                     || clazz == ASSOCIATION || clazz == DISSOCIATION) {
                 processToArcs.put(g.getId(), new ArrayList<>());
             }
+            if(clazz == AND || clazz == OR || clazz == NOT) {
+                orphanLogicGates.add(g);
+            }
+
+            // in case of submap, go inside and index all terminals
+            if(clazz == SUBMAP) {
+                for(Glyph subGlyph: g.getGlyph()) {
+                    if(GlyphClazz.fromClazz(subGlyph.getClazz()) == TERMINAL) {
+                        terminalId2Submap.put(subGlyph.getId(), g);
+                    }
+                }
+            }
+
+            glyphToArc.put(g.getId(), new ArrayList<>());
         }
 
         for(Arc arc: map.getArc()) {
             Glyph sourceGlyph;
             Glyph targetGlyph;
+            boolean isConnectedToProcess = false;
+
             if(arc.getSource() instanceof Port) {
                 Port p = (Port) arc.getSource();
                 sourceGlyph = portToGlyph.get(p.getId());
-                arcToSource.put(arc.getId(), sourceGlyph);
+            }
+            // for terminals, make links point directly at the parent submap
+            else if(arc.getSource() instanceof Glyph && ((Glyph) arc.getSource()).getClazz().equals("terminal")) {
+                // terminal should always be the target, not the source.
+                logger.warn("The arc: "+arc.getId()+" has a source terminal (id: "+((Glyph) arc.getSource()).getId()+"). " +
+                        "But Arcs should always have terminals as target.");
+                sourceGlyph = terminalId2Submap.get(((Glyph) arc.getSource()).getId());
             }
             else { // glyph itself
                 sourceGlyph = (Glyph) arc.getSource();
-                arcToSource.put(arc.getId(), sourceGlyph);
             }
+            arcToSource.put(arc.getId(), sourceGlyph);
 
             if(arc.getTarget() instanceof Port) {
                 Port p = (Port) arc.getTarget();
                 targetGlyph = portToGlyph.get(p.getId());
-                arcToTarget.put(arc.getId(), targetGlyph);
+            }
+            // for terminals, make links point directly at the parent submap
+            else if(arc.getTarget() instanceof Glyph && ((Glyph) arc.getTarget()).getClazz().equals("terminal")) {
+                targetGlyph = terminalId2Submap.get(((Glyph) arc.getTarget()).getId());
             }
             else { // glyph itself
                 targetGlyph = (Glyph) arc.getTarget();
-                arcToTarget.put(arc.getId(), targetGlyph);
             }
+            arcToTarget.put(arc.getId(), targetGlyph);
 
             if(processToArcs.containsKey(sourceGlyph.getId())){
                 processToArcs.get(sourceGlyph.getId()).add(arc);
+                isConnectedToProcess = true;
             }
             if(processToArcs.containsKey(targetGlyph.getId())){
                 processToArcs.get(targetGlyph.getId()).add(arc);
+                isConnectedToProcess = true;
+            }
+
+            if(glyphToArc.containsKey(sourceGlyph.getId())){
+                glyphToArc.get(sourceGlyph.getId()).add(arc);
+            }
+            if(glyphToArc.containsKey(targetGlyph.getId())){
+                glyphToArc.get(targetGlyph.getId()).add(arc);
+            }
+
+            /*//
+                Filter things that will be considered as orphan arcs. We want all direct arcs (that is arcs that do
+                not connect a process) and arcs that are not linked to logic gates (because those are already treated
+                when connected to process) except when the arc is also connected to phenotypes or submap. Phenotypes
+                and submaps can have connected logic gates. Those logic gates have to be processed with the orphan arcs.
+             */
+            if(         !isConnectedToProcess
+                    &&
+                        ((!SBGNUtils.isLogicGate(sourceGlyph)
+                            && !SBGNUtils.isLogicGate(targetGlyph)))) {
+                orphanArcs.add(arc);
             }
         }
 
+    }
+
+    class ReactionFeatures {
+        private boolean isReversible;
+        private boolean isBranch;
+        private boolean isAssociation;
+        private boolean isLogicGateReaction;
+
+        public ReactionFeatures(boolean isReversible, boolean isBranch, boolean isAssociation) {
+            this.isReversible = isReversible;
+            this.isBranch = isBranch;
+            this.isAssociation = isAssociation;
+            this.isLogicGateReaction = false;
+        }
+
+        public ReactionFeatures(boolean isReversible, boolean isBranch, boolean isAssociation, boolean isLogicGateReaction) {
+            this.isReversible = isReversible;
+            this.isBranch = isBranch;
+            this.isAssociation = isAssociation;
+            this.isLogicGateReaction = isLogicGateReaction;
+        }
+
+        public boolean isReversible() {
+            return isReversible;
+        }
+
+        public boolean isAssociation() {
+            return isBranch && isAssociation;
+        }
+
+        public boolean isDissociation() {
+            return isBranch && !isAssociation;
+        }
+
+        public boolean isReactionSimple() {
+            return !isBranch;
+        }
+
+        public boolean isLogicGateReaction() {
+            return isLogicGateReaction;
+        }
+    }
+
+
+    public SimpleEntry<Link, Link> baseLinkProcessingStep1(ReactantWrapper reactantW, Glyph glyph, Arc arc,
+                                       Point2D.Float absAssocPoint,
+                                       boolean isReactant, ReactionFeatures options) {
+        // get point lists in correct order
+        // apply the mapBounds correction to each point of the arc to get consistent coords
+        List<Point2D.Float> reactantPoints0 = applyCorrection(SBGNUtils.getPoints(arc),
+                (float) mapBounds.getX(),(float) mapBounds.getY());
+        if(options.isReversible() && isReactant) {
+            Collections.reverse(reactantPoints0);
+        }
+        Link reactantLink0 = new Link(reactantPoints0);
+
+
+        // infer best anchorpoints possible
+        Rectangle2D.Float baseRect0 = SBGNUtils.getRectangleFromGlyph(glyph);
+        baseRect0.setRect(
+                baseRect0.getX() - mapBounds.getX(),
+                baseRect0.getY() - mapBounds.getY(),
+                baseRect0.getWidth(),
+                baseRect0.getHeight());
+        AnchorPoint startAnchor0;
+        if(isReactant) {
+            startAnchor0 = inferAnchorPoint(reactantLink0.getStart(), reactantW, baseRect0);
+        }
+        else {
+            startAnchor0 = inferAnchorPoint(reactantLink0.getEnd(), reactantW, baseRect0);
+        }
+        reactantW.setAnchorPoint(startAnchor0);
+
+        // compute exact final points from the inferred anchor
+        Point2D.Float finalPoint = getFinalpoint(
+                reactantW.getAnchorPoint(),
+                reactantW,
+                baseRect0);
+
+        /*  compute branch edit points
+                reverse points for consumption because CellDesigner consider all branches to start from association
+                glyph. Don't reverse points for reversible reactions, as the production arcs already point to the right
+                direction.
+            */
+        List<Point2D.Float> editpoints0 = reactantLink0.getEditPoints();
+        if(!options.isReversible && isReactant)
+            Collections.reverse(editpoints0);
+
+        List<AffineTransform> transforms;
+        if(options.isLogicGateReaction) {
+            transforms = GeometryUtils.getTransformsToLocalCoords(finalPoint, absAssocPoint);
+        }
+        else {
+            transforms = GeometryUtils.getTransformsToLocalCoords(absAssocPoint, finalPoint);
+        }
+
+        List<Point2D.Float> localEditPoints0 = GeometryUtils.convertPoints(editpoints0, transforms);
+        List<Point2D.Float> finalAndLocalPoints = new ArrayList<>();
+        finalAndLocalPoints.add(new Point2D.Float());
+        finalAndLocalPoints.addAll(localEditPoints0);
+        finalAndLocalPoints.add(finalPoint);
+        return new SimpleEntry<>(new Link(finalAndLocalPoints), reactantLink0);
+    }
+
+    public SimpleEntry<Point2D.Float, Point2D.Float> getAssocDissocPoints(List<ReactantWrapper> reactants,
+                                                                          Glyph processGlyph,
+                                                                          Point2D.Float processCoords,
+                                                                          Arc arc, boolean isAssociation) {
+        // define association glyph absolute point
+            /*
+                If there are ports, consider association to be on the first port, that way all the links are
+                already pointing to it.
+                If no ports, consider the Celldesigner association glyph to be on the process, and move the process
+                a bit. Not too far because it will shift all the additional links and modification links.
+              */
+        Point2D.Float absAssocPoint = null;
+        if(processGlyph.getPort().size() > 0) {
+            // we need to get the port that is on the opposite side of the product
+            Port oppositePort;
+            if(isAssociation) {
+                oppositePort = (Port) arc.getSource();
+            }
+            else {
+                oppositePort = (Port) arc.getTarget();
+            }
+
+            Port consumptionPort = null;
+            for(Port p: processGlyph.getPort()){
+                if(p != oppositePort) {
+                    consumptionPort = p;
+                    break;
+                }
+            }
+            absAssocPoint = new Point2D.Float(
+                    consumptionPort.getX() - (float) mapBounds.getX(),
+                    consumptionPort.getY() - (float) mapBounds.getY());
+
+        }
+        else {
+            absAssocPoint = new Point2D.Float(
+                    (float) (processCoords.getX() - mapBounds.getX()),
+                    (float) (processCoords.getY() - mapBounds.getY())
+            );
+        }
+
+        // compute association glyph relative point
+        Point2D.Float localAssocPoint = GeometryUtils.convertPoints(
+                Collections.singletonList(absAssocPoint),
+                GeometryUtils.getTransformsToLocalCoords(
+                        reactants.get(0).getCenterPoint(),
+                        reactants.get(1).getCenterPoint(),
+                        reactants.get(2).getCenterPoint()
+                )).get(0);
+        return new SimpleEntry<>(absAssocPoint, localAssocPoint);
+    }
+
+    public Line2D.Float getProcessLine(Link link, Point2D assocPoint, ReactionFeatures options) {
+        if(link.getEditPoints().size() > 0) { // there are some edit points
+            if(options.isAssociation())
+                return new Line2D.Float(
+                        assocPoint,
+                        link.getEditPoints().get(0)
+                );
+            else
+                return new Line2D.Float(
+                        link.getEditPoints().get(0),
+                        assocPoint
+                );
+        }
+        else { // straight line
+            if(options.isAssociation())
+                return new Line2D.Float(
+                        assocPoint,
+                        link.getEnd()
+                );
+            else
+                return new Line2D.Float(
+                        link.getStart(),
+                        assocPoint
+                );
+        }
+    }
+
+    /**
+     *
+     * @param arcIds2LocalEditPoints at least 2 entries, 3 for branch reactions
+     * @param processGLyphId
+     * @param localAssocPoint
+     * @return
+     */
+    public LineWrapper buildLineWrapperWithProcess(java.util.Map<String, List<Point2D.Float>> arcIds2LocalEditPoints,
+                                                   String processGLyphId, Point2D.Float localAssocPoint) {
+        // finally set up the xml elements and add to reactions
+        List<String> arcsIds = new ArrayList<>();
+        List<List<Point2D.Float>> editPointsList = new ArrayList<>();
+        List<Integer> segmentCountList = new ArrayList<>();
+        int totalSegmentCount = 1;
+        int processSegmentIndex = 0;
+        boolean isBranchReactionType = localAssocPoint != null;
+
+        boolean isFirstEntry = true;
+        for(java.util.Map.Entry<String, List<Point2D.Float>> entry: arcIds2LocalEditPoints.entrySet()) {
+            arcsIds.add(entry.getKey());
+            editPointsList.add(entry.getValue());
+            segmentCountList.add(entry.getValue().size()+1);
+            totalSegmentCount += entry.getValue().size();
+            if(isFirstEntry) {
+                isFirstEntry = false;
+                processSegmentIndex = entry.getValue().size();
+            }
+        }
+
+        ConnectScheme connectScheme;
+        if(isBranchReactionType) {
+            connectScheme = getBranchConnectScheme(segmentCountList);
+        }
+        else {
+            connectScheme = getSimpleConnectScheme(totalSegmentCount, processSegmentIndex);
+        }
+
+
+        String lineColor = "ff000000";
+        float lineWidth = 1;
+        /*
+            Set a style only if all components' style are the same
+         */
+        if(mapHasStyle) {
+            boolean areAllStyleTheSame = true;
+            StyleInfo arcStyle1 = styleMap.get(arcsIds.get(0));
+            // check all styles are homogeneous by comparing all other arcs styles to arcStyle1
+            for(int i=1; i < arcsIds.size(); i++) {
+                StyleInfo arcStyle2 = styleMap.get(arcsIds.get(i));
+                if(arcStyle1.getLineWidth() != arcStyle2.getLineWidth()
+                        || !arcStyle1.getLineColor().equals(arcStyle2.getLineColor())) {
+                    areAllStyleTheSame = false;
+                    break;
+                }
+            }
+            // finally check that all arc's styles are consistent with process glyph style
+            StyleInfo processGlyphStyle = styleMap.get(processGLyphId);
+            if(arcStyle1.getLineWidth() != processGlyphStyle.getLineWidth()
+                    || !arcStyle1.getLineColor().equals(processGlyphStyle.getLineColor())) {
+                areAllStyleTheSame = false;
+            }
+
+            if(areAllStyleTheSame) { // styles are all consistent
+                lineWidth = arcStyle1.getLineWidth();
+                lineColor = arcStyle1.getLineColor();
+            }
+        }
+
+        Line line = new Line();
+        line.setWidth(BigDecimal.valueOf(lineWidth));
+        line.setColor(lineColor);
+
+        List<String> editPointString = new ArrayList<>();
+        List<Point2D.Float> mergedList = new ArrayList<>();
+        for(List<Point2D.Float> editPoints: editPointsList) {
+            mergedList.addAll(editPoints);
+        }
+        if(isBranchReactionType) { // the assocPoint needs to be added at the end of the string
+            mergedList.add(localAssocPoint);
+        }
+        for(Point2D.Float p: mergedList) {
+            editPointString.add(p.getX()+","+p.getY());
+        }
+
+        LineWrapper lineWrapper = new LineWrapper(connectScheme, editPointString, line);
+        if(isBranchReactionType) {
+            // here the number of edit points is needed
+            lineWrapper.setNum0(segmentCountList.get(0) - 1);
+            lineWrapper.setNum1(segmentCountList.get(1) - 1);
+            lineWrapper.setNum2(segmentCountList.get(2) - 1);
+            lineWrapper.settShapeIndex(0);
+        }
+
+        return lineWrapper;
+    }
+
+    /**
+     *
+     * @param arcId
+     * @param localEditPoints
+     * @param additionalPoint for logic gates, their coordinates must be added at the end of the edit points string
+     * @return
+     */
+    public LineWrapper buildLineWrapper(String arcId, List<Point2D.Float> localEditPoints, Point2D.Float additionalPoint) {
+
+        String lineColor = "ff000000";
+        float lineWidth = 1;
+        if(mapHasStyle) {
+            StyleInfo styleInfo = styleMap.get(arcId);
+            lineWidth = styleInfo.getLineWidth();
+            lineColor = styleInfo.getLineColor();
+        }
+
+        int segmentCount = localEditPoints.size() + 1;
+
+        ConnectScheme connectScheme = getSimpleConnectScheme(segmentCount, -1);
+
+        LineType2 line = new LineType2();
+        line.setWidth(BigDecimal.valueOf(lineWidth));
+        line.setColor(lineColor);
+        line.setType("Straight");
+
+        List<String> editPointString = new ArrayList<>();
+        for(Point2D.Float p: localEditPoints) {
+            editPointString.add(p.getX()+","+p.getY());
+        }
+
+        if(additionalPoint != null) {
+            editPointString.add(additionalPoint.getX()+","+additionalPoint.getY());
+        }
+
+        return new LineWrapper(connectScheme, editPointString, line);
     }
 
     public static AnchorPoint inferAnchorPoint(Point2D.Float p, ReactantWrapper reactantW, Rectangle2D.Float rect) {
@@ -1494,6 +2242,37 @@ public class SBGNML2CD extends GeneralConverter {
             p.setLocation(p.getX() - xdiff, p.getY() - ydiff);
         }
         return points;
+    }
+
+    /**
+     * Get the notes from an SBGN entity and add it to the provided object
+     * @param notesFeature
+     * @param sbgnEntity
+     */
+    public void setNotes(INotesFeature notesFeature, SBGNBase sbgnEntity) {
+        if(sbgnEntity.getNotes() != null
+                && sbgnEntity.getNotes().getAny().size() > 0) {
+            Element notes = sbgnEntity.getNotes().getAny().get(0);
+            notesFeature.setNotes(notes);
+        }
+    }
+
+    /**
+     * Get the annotations from an SBGN element and add it to the provided object
+     * @param annotationsFeature
+     * @param sbgnEntity
+     */
+    public void setAnnotations(IAnnotationsFeature annotationsFeature, SBGNBase sbgnEntity) {
+        if(sbgnEntity.getExtension() != null) {
+            for(Element e: sbgnEntity.getExtension().getAny()){
+                if(e.getTagName().equals("annotation")) {
+                    // TODO urn:miriam:CHEBI:12 doesn't seem to be loaded by CD
+                    // TODO find a way to resolve uri ?
+                    Element rdf = SBGNUtils.sanitizeRdfURNs((Element) e.getElementsByTagName("rdf:RDF").item(0));
+                    annotationsFeature.setAnnotations(rdf);
+                }
+            }
+        }
     }
 
 

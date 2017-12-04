@@ -1,17 +1,14 @@
 package fr.curie.cd2sbgnml;
 
 import fr.curie.cd2sbgnml.xmlcdwrappers.StyleInfo;
-import jdk.nashorn.internal.runtime.regexp.joni.Regex;
 import org.sbgn.ArcClazz;
 import org.sbgn.GlyphClazz;
 import org.sbgn.bindings.*;
-import org.sbml._2001.ns.celldesigner.Point;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.w3c.dom.Element;
 import org.w3c.dom.NodeList;
 
-import java.awt.*;
 import java.awt.geom.Point2D;
 import java.awt.geom.Rectangle2D;
 import java.util.*;
@@ -19,6 +16,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+
+import static org.sbgn.GlyphClazz.*;
 
 public class SBGNUtils {
 
@@ -179,6 +178,42 @@ public class SBGNUtils {
         return false;
     }
 
+    public static Optional<Glyph> getUnitOfInfo(Glyph glyph, String regexp) {
+        Pattern p = Pattern.compile(regexp, Pattern.CASE_INSENSITIVE);
+        for(Glyph subglyph: glyph.getGlyph()) {
+            if(subglyph.getClazz().equals("unit of information")) {
+                String info = subglyph.getLabel().getText();
+                Matcher m = p.matcher(info);
+                if(m.find()){
+                    return Optional.of(subglyph);
+                }
+            }
+        }
+        return Optional.empty();
+    }
+
+    /**
+     * Will check the presence of a unit of information with content: "N:"+multimer count
+     * and return multimer count
+     * @param glyph
+     * @return 0 if no unit of info concerning multimer, else number of multimer
+     */
+    public static int getMultimerFromInfo(Glyph glyph) {
+        if(SBGNUtils.hasUnitOfInfo(glyph, "N\\s*:\\s*\\d+")){
+            Pattern p = Pattern.compile("N\\s*:\\s*(\\d+)", Pattern.CASE_INSENSITIVE);
+            for(Glyph subglyph: glyph.getGlyph()) {
+                if(subglyph.getClazz().equals("unit of information")) {
+                    String info = subglyph.getLabel().getText();
+                    Matcher m = p.matcher(info);
+                    if(m.find()){
+                        return Integer.parseInt(m.group(1));
+                    }
+                }
+            }
+        }
+        return 0;
+    }
+
     /**
      * Given a list of arcs all belonging to the same reaction (= attached to the same process glyph),
      * determines wether the reaction is reversible or not.
@@ -225,15 +260,40 @@ public class SBGNUtils {
 
         if(isReversible) {
             // transfer one product to the reactant list
-            System.out.println("Transfer element");
-            System.out.println(reactants.size()+" "+products.size()+" "+modifiers.size());
             reactants.add(products.remove(0));
-            System.out.println(reactants.size()+" "+products.size()+" "+modifiers.size());
         }
 
         result.add(reactants);
         result.add(products);
         result.add(modifiers);
+        return result;
+    }
+
+    /**
+     * Determines which arcs are baseReactants and the baseProduct for a boolean logic gate reaction type
+     * @param arcs
+     * @return
+     */
+    public static List<List<Arc>> getBLGReactantTypes(List<Arc> arcs) {
+        List<List<Arc>> result = new ArrayList<>();
+        List<Arc> product = new ArrayList<>();
+        List<Arc> reactants = new ArrayList<>();
+        for(Arc arc: arcs){
+            ArcClazz clazz = ArcClazz.fromClazz(arc.getClazz());
+            switch(clazz) {
+                case LOGIC_ARC: reactants.add(arc); break;
+                default: product.add(arc);
+            }
+        }
+        if(product.size() > 1) {
+            // logic gates shouldn't have more than 1 output arc
+            // TODO output list of arc id
+            logger.error("Logic gate has more than 1 output arc, only the first arc will be considered, others are" +
+                    "discarded.");
+        }
+
+        result.add(reactants);
+        result.add(product);
         return result;
     }
 
@@ -245,7 +305,6 @@ public class SBGNUtils {
      * @return
      */
     public static boolean isReactionAssociation(Glyph process, List<Arc> reactants, List<Arc> products) {
-        System.out.println("isASSociation ? "+process.getClazz());
         if(process.getClazz().equals("association")) { // trivial case of specific process node
             return true;
         }
@@ -303,7 +362,6 @@ public class SBGNUtils {
 
     public static void sanitizeSubGlyphs(List<Glyph> subglyphs) {
         for(Glyph g: subglyphs) {
-            System.out.println("Replace id: "+g.getId());
             g.setId(g.getId().replaceAll("-", "_"));
             sanitizeSubGlyphs(g.getGlyph());
         }
@@ -320,35 +378,31 @@ public class SBGNUtils {
      * @return
      */
     public static Sbgn sanitizeIds(Sbgn sbgn) {
-        for(Glyph g: sbgn.getMap().get(0).getGlyph()){
+        for(Glyph g: sbgn.getMap()/*.get(0)*/.getGlyph()){
 
-            System.out.println("Replace id: "+g.getId());
             g.setId(g.getId().replaceAll("-", "_"));
 
             sanitizeSubGlyphs(g.getGlyph());
 
             if(g.getPort().size() > 0) {
                 for(Port p: g.getPort()) {
-                    System.out.println("Replace id: "+p.getId());
-                    p.setId(p.getId().replaceAll("-", "_"));
+                     p.setId(p.getId().replaceAll("-", "_"));
                 }
             }
         }
 
-        /* source and target are reference to objects, probably useless to update
-        for(Arc a: sbgn.getMap().get(0).getArc()) {
-
-        }*/
+        for(Arc a: sbgn.getMap()/*.get(0)*/.getArc()) {
+            a.setId(a.getId().replaceAll("-", "_"));
+        }
 
         // change ids in style
-        if(sbgn.getMap().get(0).getExtension() != null) {
-            for (Element e : sbgn.getMap().get(0).getExtension().getAny()) {
+        if(sbgn.getMap()/*.get(0)*/.getExtension() != null) {
+            for (Element e : sbgn.getMap()/*.get(0)*/.getExtension().getAny()) {
                 if (e.getTagName().equals("renderInformation")) {
                     NodeList nodeList = e.getElementsByTagName("style");
 
                     for (int i = 0; i < nodeList.getLength(); i++) {
                         Element e2 = (Element) nodeList.item(i);
-                        System.out.println("Replace id: " + e2.getAttribute("idList"));
                         e2.setAttribute("idList", e2.getAttribute("idList").replaceAll("-", "_"));
                     }
                 }
@@ -370,5 +424,32 @@ public class SBGNUtils {
                 g.getBbox().getW(),
                 g.getBbox().getH()
         );
+    }
+
+    public static boolean isLogicGate(Glyph g) {
+        return GlyphClazz.fromClazz(g.getClazz()) == AND
+                || GlyphClazz.fromClazz(g.getClazz()) == OR
+                || GlyphClazz.fromClazz(g.getClazz()) == NOT;
+    }
+
+    public static List<Glyph> getStateVariables(Glyph g) {
+        int i=1;
+        List<Glyph> result = new ArrayList<>();
+        for(Glyph subglyph: g.getGlyph()) {
+            if(GlyphClazz.fromClazz(subglyph.getClazz()) == STATE_VARIABLE) {
+                //Glyph.State state = subglyph.getState();
+                /*String stateVar = subglyph.getState().getVariable();
+                String value = subglyph.getState().getValue();
+
+                ResidueWrapper resW = new ResidueWrapper("rs"+i);
+                resW.useAngle = true;
+                resW.name = stateVar;
+                resW.state = ResidueWrapper.getLongState(value);
+                result.add(resW);
+                i++;*/
+                result.add(subglyph);
+            }
+        }
+        return result;
     }
 }

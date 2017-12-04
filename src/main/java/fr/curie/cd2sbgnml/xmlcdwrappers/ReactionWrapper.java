@@ -6,19 +6,16 @@ import org.sbml.sbml.level2.version4.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.w3c.dom.Element;
-import org.w3c.dom.Node;
 
 import java.awt.geom.Point2D;
-import java.net.ConnectException;
 import java.util.*;
 import java.util.AbstractMap.SimpleEntry;
 
-public class ReactionWrapper {
+import static fr.curie.cd2sbgnml.xmlcdwrappers.ModificationLinkType.*;
+
+public class ReactionWrapper implements INotesFeature, IAnnotationsFeature {
 
     private static final Logger logger = LoggerFactory.getLogger(ReactionWrapper.class);
-
-    public enum ReactionType { STATE_TRANSITION, HETERODIMER_ASSOCIATION, DISSOCIATION,
-        KNOWN_TRANSITION_OMITTED, UNKNOWN_TRANSITION}
 
     private String id;
     private List<ReactantWrapper> baseReactants;
@@ -28,17 +25,17 @@ public class ReactionWrapper {
     private List<ReactantWrapper> modifiers;
     private List<LogicGateWrapper> logicGates;
     private int processSegmentIndex;
-    private String reactionType; // TODO change to ReactionType
+    private ReactionType reactionType;
     private boolean hasProcess;
     private boolean isReversible;
     private LineWrapper lineWrapper;
-    private SBase.Notes notes;
+    private Element notes;
     private Element annotations;
 
     public ReactionWrapper (String id, ReactionType type,
                             List<ReactantWrapper> baseReactants, List<ReactantWrapper> baseProducts) {
         this.id = id;
-        this.reactionType = type.toString();
+        this.reactionType = type;
         this.baseReactants = baseReactants;
         this.baseProducts = baseProducts;
         this.additionalProducts = new ArrayList<>();
@@ -57,13 +54,13 @@ public class ReactionWrapper {
         this.modifiers = new ArrayList<>();
         this.logicGates = new ArrayList<>();
         this.processSegmentIndex = getProcessSegment(reaction);
-        this.reactionType = reaction.getAnnotation().getExtension().getReactionType();
+        this.reactionType = ReactionType.valueOf(reaction.getAnnotation().getExtension().getReactionType());
         this.hasProcess = hasProcess(reaction);
         this.isReversible = reaction.isReversible(); //  reaction.isSetReversible() ? Boolean.parseBoolean(reaction.getReversible()) : true;
         this.lineWrapper = new LineWrapper(reaction.getAnnotation().getExtension().getConnectScheme(),
                 reaction.getAnnotation().getExtension().getEditPoints(),
                 reaction.getAnnotation().getExtension().getLine());
-        this.notes = reaction.getNotes();
+        this.notes = Utils.getNotes(reaction.getNotes());
         this.annotations = Utils.getRDFAnnotations(reaction.getAnnotation().getAny());
 
         // fill the corresponding lists
@@ -80,8 +77,6 @@ public class ReactionWrapper {
                 case ADDITIONAL_PRODUCT: this.additionalProducts.add(reactW); break;
                 case MODIFICATION: this.modifiers.add(reactW); break;
             }
-
-            //System.out.println("Reactant link start point: "+ reaction.getId()+" "+reactW.getAliasW().getId()+" "+reactW.getLinkStartingPoint());
         }
 
     }
@@ -204,37 +199,6 @@ public class ReactionWrapper {
         return parseEditPointsString(editPointString);
     }
 
-    public static List<Point2D.Float> getEditPointsForBranch(Reaction reaction, int b) {
-        List<Point2D.Float> editPoints = getBaseEditPoints(reaction);
-        int num0 = (int) reaction.getAnnotation().getExtension().getEditPoints().getNum0();
-        int num1 = (int) reaction.getAnnotation().getExtension().getEditPoints().getNum1();
-        int num2 = (int) reaction.getAnnotation().getExtension().getEditPoints().getNum2();
-
-        List<Point2D.Float> finalEditPoints = new ArrayList<>();
-        switch(b) {
-            case 0:
-                for(int i=0; i < num0; i++) {
-                    finalEditPoints.add(editPoints.get(i));
-                }
-                break;
-            case 1:
-                for(int i=num0; i < num0 + num1; i++) {
-                    finalEditPoints.add(editPoints.get(i));
-                }
-                break;
-            case 2:
-                // don't go to the end of edit points list, last one may be
-                // for association/dissociation point or for logic gate
-                for(int i=num0 + num1; i < num0 + num1 + num2; i++) {
-                    finalEditPoints.add(editPoints.get(i));
-                }
-                break;
-            default:
-                throw new RuntimeException("Value: "+b+" not allowed for branch index. Authorized values: 0, 1, 2.");
-        }
-        return finalEditPoints;
-    }
-
     public List<Point2D.Float> getEditPointsForBranch(int b) {
         List<Point2D.Float> editPoints = this.getLineWrapper().getEditPoints();
         int num0 = this.getLineWrapper().getNum0();
@@ -353,8 +317,6 @@ public class ReactionWrapper {
         reaction.setListOfReactants(listOfReactants);
         ListOfSpeciesReferences listOfProducts = new ListOfSpeciesReferences();
         reaction.setListOfProducts(listOfProducts);
-        ListOfModifierSpeciesReferences listOfModifiers = new ListOfModifierSpeciesReferences();
-        reaction.setListOfModifiers(listOfModifiers);
 
         // init annotation part
         ReactionAnnotationType annotation = new ReactionAnnotationType();
@@ -363,14 +325,21 @@ public class ReactionWrapper {
         Extension ext = new Extension();
         annotation.setExtension(ext);
 
-        ext.setReactionType(this.getReactionType());
+        ext.setReactionType(this.getReactionType().toString());
 
         ext.setConnectScheme(this.getLineWrapper().getCDConnectScheme());
         ext.setLine(this.getLineWrapper().getCDLine());
         boolean isBranchType =
-                ReactionType.valueOf(this.getReactionType()) == ReactionType.HETERODIMER_ASSOCIATION
-                || ReactionType.valueOf(this.getReactionType()) == ReactionType.DISSOCIATION;
-        ext.setEditPoints(this.getLineWrapper().getCDEditPoints(isBranchType));
+                this.getReactionType() == ReactionType.HETERODIMER_ASSOCIATION
+                || this.getReactionType() == ReactionType.DISSOCIATION;
+
+        if(this.getLineWrapper().getEditPoints().size() > 0) {
+            ext.setEditPoints(this.getLineWrapper().getCDEditPoints(isBranchType));
+        }
+
+        // metaids cannot be the same, so we keep a global counter for the reaction, and use the reaction
+        // id in the metaid. This should ensure uniqueness in all the document.
+        int metaCounter = 1;
 
         // base reactant list
         BaseReactants baseReactants = new BaseReactants();
@@ -379,20 +348,8 @@ public class ReactionWrapper {
             BaseReactant baseReactant = (BaseReactant) reactantWrapper.getCDElement();
             baseReactants.getBaseReactant().add(baseReactant);
 
-            // create associated speciesReference for the sbml list
-            SpeciesReference speciesReference = new SpeciesReference();
-            speciesReference.setSpecies(reactantWrapper.getAliasW().getSpeciesW().getId());
-            speciesReference.setMetaid(reactantWrapper.getAliasW().getSpeciesW().getId());
-
-            SpeciesReferenceAnnotationType speciesRefAnnotation = new SpeciesReferenceAnnotationType();
-            speciesReference.setAnnotation(speciesRefAnnotation);
-
-            SpeciesReferenceAnnotationType.Extension speciesRefExt = new SpeciesReferenceAnnotationType.Extension();
-            speciesRefAnnotation.setExtension(speciesRefExt);
-
-            speciesRefExt.setAlias(reactantWrapper.getAliasW().getId());
-
-            listOfReactants.getSpeciesReference().add(speciesReference);
+            listOfReactants.getSpeciesReference().add(getSpeciesReference(reactantWrapper, metaCounter));
+            metaCounter++;
         }
 
         // base product list
@@ -402,20 +359,8 @@ public class ReactionWrapper {
             BaseProduct baseProduct = (BaseProduct) reactantWrapper.getCDElement();
             baseProducts.getBaseProduct().add(baseProduct);
 
-            // create associated speciesReference for the sbml list
-            SpeciesReference speciesReference = new SpeciesReference();
-            speciesReference.setSpecies(reactantWrapper.getAliasW().getSpeciesW().getId());
-            speciesReference.setMetaid(reactantWrapper.getAliasW().getSpeciesW().getId());
-
-            SpeciesReferenceAnnotationType speciesRefAnnotation = new SpeciesReferenceAnnotationType();
-            speciesReference.setAnnotation(speciesRefAnnotation);
-
-            SpeciesReferenceAnnotationType.Extension speciesRefExt = new SpeciesReferenceAnnotationType.Extension();
-            speciesRefAnnotation.setExtension(speciesRefExt);
-
-            speciesRefExt.setAlias(reactantWrapper.getAliasW().getId());
-
-            listOfProducts.getSpeciesReference().add(speciesReference);
+            listOfProducts.getSpeciesReference().add(getSpeciesReference(reactantWrapper, metaCounter));
+            metaCounter++;
         }
 
         if(this.getAdditionalReactants().size() > 0) {
@@ -423,20 +368,8 @@ public class ReactionWrapper {
             for(ReactantWrapper w: this.getAdditionalReactants()) {
                 listOfReactantLinks.getReactantLink().add((ReactantLink) w.getCDElement());
 
-                // create associated speciesReference for the sbml list
-                SpeciesReference speciesReference = new SpeciesReference();
-                speciesReference.setSpecies(w.getAliasW().getSpeciesW().getId());
-                speciesReference.setMetaid(w.getAliasW().getSpeciesW().getId());
-
-                SpeciesReferenceAnnotationType speciesRefAnnotation = new SpeciesReferenceAnnotationType();
-                speciesReference.setAnnotation(speciesRefAnnotation);
-
-                SpeciesReferenceAnnotationType.Extension speciesRefExt = new SpeciesReferenceAnnotationType.Extension();
-                speciesRefAnnotation.setExtension(speciesRefExt);
-
-                speciesRefExt.setAlias(w.getAliasW().getId());
-
-                listOfReactants.getSpeciesReference().add(speciesReference);
+                listOfReactants.getSpeciesReference().add(getSpeciesReference(w, metaCounter));
+                metaCounter++;
             }
             ext.setListOfReactantLinks(listOfReactantLinks);
         }
@@ -446,49 +379,127 @@ public class ReactionWrapper {
             for(ReactantWrapper w: this.getAdditionalProducts()) {
                 listOfProductLinks.getProductLink().add((ProductLink) w.getCDElement());
 
-                // create associated speciesReference for the sbml list
-                SpeciesReference speciesReference = new SpeciesReference();
-                speciesReference.setSpecies(w.getAliasW().getSpeciesW().getId());
-                speciesReference.setMetaid(w.getAliasW().getSpeciesW().getId());
-
-                SpeciesReferenceAnnotationType speciesRefAnnotation = new SpeciesReferenceAnnotationType();
-                speciesReference.setAnnotation(speciesRefAnnotation);
-
-                SpeciesReferenceAnnotationType.Extension speciesRefExt = new SpeciesReferenceAnnotationType.Extension();
-                speciesRefAnnotation.setExtension(speciesRefExt);
-
-                speciesRefExt.setAlias(w.getAliasW().getId());
-
-                listOfProducts.getSpeciesReference().add(speciesReference);
+                listOfProducts.getSpeciesReference().add(getSpeciesReference(w, metaCounter));
+                metaCounter++;
             }
             ext.setListOfProductLinks(listOfProductLinks);
         }
 
-        if(this.getModifiers().size() > 0) {
-            ListOfModification listOfModification = new ListOfModification();
-            for(ReactantWrapper w: this.getModifiers()) {
-                listOfModification.getModification().add((Modification) w.getCDElement());
+        // if special logic gate reaction, we need to add gate members in addition to the base reactants and product
+        if(this.getReactionType().equals("BOOLEAN_LOGIC_GATE")) {
+            ListOfGateMember listOfGateMember = new ListOfGateMember();
 
-                // create associated speciesReference for the sbml list
-                ModifierSpeciesReference speciesReference = new ModifierSpeciesReference();
-                speciesReference.setSpecies(w.getAliasW().getSpeciesW().getId());
-                speciesReference.setMetaid(w.getAliasW().getSpeciesW().getId());
+            listOfGateMember.getGateMember().add(((LogicGateWrapper)this.getModifiers().get(0)).getCDElement());
 
-                SpeciesReferenceAnnotationType speciesRefAnnotation = new SpeciesReferenceAnnotationType();
-                speciesReference.setAnnotation(speciesRefAnnotation);
-
-                SpeciesReferenceAnnotationType.Extension speciesRefExt = new SpeciesReferenceAnnotationType.Extension();
-                speciesRefAnnotation.setExtension(speciesRefExt);
-
-                speciesRefExt.setAlias(w.getAliasW().getId());
-
-                listOfModifiers.getModifierSpeciesReference().add(speciesReference);
+            for(ReactantWrapper reactantWrapper: this.getBaseReactants()) {
+                listOfGateMember.getGateMember().add(reactantWrapper.getAsModification());
             }
-            ext.setListOfModification(listOfModification);
+
+            ext.setListOfGateMember(listOfGateMember);
+        }
+        else {
+            if (this.getModifiers().size() > 0) {
+                ListOfModifierSpeciesReferences listOfModifiers = new ListOfModifierSpeciesReferences();
+                reaction.setListOfModifiers(listOfModifiers);
+
+                ListOfModification listOfModification = new ListOfModification();
+                logger.debug("Number of modifiers to serialize: " + this.getModifiers().size());
+                for (ReactantWrapper w : this.getModifiers()) {
+                    listOfModification.getModification().add((Modification) w.getCDElement());
+
+                    // create associated speciesReference for the sbml list
+                    logger.debug("modif type: " + w.getModificationLinkType() + " " + w.getAliasW() + " " + this.getId() +
+                            " " + this.getModifiers().size() + " " + (w instanceof LogicGateWrapper));
+                    if (w.getAliasW() != null)
+                        logger.debug("isincluded ? " + w.getAliasW().getSpeciesW().isIncludedSpecies());
+                    /*
+                        Logic gates are not listed in the species reference
+                        If included species, the species reference must be the one of the topmost parent complex
+                     */
+                    if (!(w.getModificationLinkType() == BOOLEAN_LOGIC_GATE_UNKNOWN
+                            || w.getModificationLinkType() == BOOLEAN_LOGIC_GATE_AND
+                            || w.getModificationLinkType() == BOOLEAN_LOGIC_GATE_OR
+                            || w.getModificationLinkType() == BOOLEAN_LOGIC_GATE_NOT)) {
+
+                        listOfModifiers.getModifierSpeciesReference().add(getModifierSpeciesReference(w, metaCounter));
+                        metaCounter++;
+                    }
+                }
+                ext.setListOfModification(listOfModification);
+            }
         }
 
+        // notes and annotations
+        if(this.getNotes() != null) {
+            SBase.Notes notes = new SBase.Notes();
+            reaction.setNotes(notes);
+            notes.getAny().add(this.getNotes());
+        }
+
+        if(this.getAnnotations() != null) {
+            annotation.getAny().add(this.getAnnotations());
+        }
 
         return reaction;
+    }
+
+    /**
+     * Metaids cannot be the same
+     * @param w
+     * @return
+     */
+    private SpeciesReference getSpeciesReference(ReactantWrapper w, int metaCount) {
+        String aliasId, speciesId;
+        if(w.getAliasW().getSpeciesW().isIncludedSpecies()) {
+            aliasId = w.getAliasW().getTopLevelParent().getId();
+            speciesId = w.getAliasW().getTopLevelParent().getSpeciesId();
+        }
+        else {
+            aliasId = w.getAliasW().getId();
+            speciesId = w.getAliasW().getSpeciesW().getId();
+        }
+
+        // create associated speciesReference for the sbml list
+        SpeciesReference speciesReference = new SpeciesReference();
+        speciesReference.setSpecies(speciesId);
+        speciesReference.setMetaid(this.getId()+"_meta"+metaCount+"_"+speciesId);
+
+        SpeciesReferenceAnnotationType speciesRefAnnotation = new SpeciesReferenceAnnotationType();
+        speciesReference.setAnnotation(speciesRefAnnotation);
+
+        SpeciesReferenceAnnotationType.Extension speciesRefExt = new SpeciesReferenceAnnotationType.Extension();
+        speciesRefAnnotation.setExtension(speciesRefExt);
+
+        speciesRefExt.setAlias(aliasId);
+
+        return speciesReference;
+    }
+
+    private ModifierSpeciesReference getModifierSpeciesReference(ReactantWrapper w, int metaCount) {
+        String aliasId, speciesId;
+        if(w.getAliasW().getSpeciesW().isIncludedSpecies()) {
+            aliasId = w.getAliasW().getTopLevelParent().getId();
+            speciesId = w.getAliasW().getTopLevelParent().getSpeciesId();
+        }
+        else {
+            aliasId = w.getAliasW().getId();
+            speciesId = w.getAliasW().getSpeciesW().getId();
+        }
+
+        // create associated speciesReference for the sbml list
+        ModifierSpeciesReference speciesReference = new ModifierSpeciesReference();
+        speciesReference.setSpecies(speciesId);
+        speciesReference.setMetaid(this.getId()+"_meta"+metaCount+"_"+speciesId);
+
+        SpeciesReferenceAnnotationType speciesRefAnnotation = new SpeciesReferenceAnnotationType();
+        speciesReference.setAnnotation(speciesRefAnnotation);
+
+        SpeciesReferenceAnnotationType.Extension speciesRefExt = new SpeciesReferenceAnnotationType.Extension();
+        speciesRefAnnotation.setExtension(speciesRefExt);
+
+        speciesRefExt.setAlias(aliasId);
+
+        return speciesReference;
     }
 
 
@@ -534,7 +545,7 @@ public class ReactionWrapper {
         return processSegmentIndex;
     }
 
-    public String getReactionType() {
+    public ReactionType getReactionType() {
         return reactionType;
     }
 
@@ -554,7 +565,7 @@ public class ReactionWrapper {
         this.lineWrapper = lineWrapper;
     }
 
-    public SBase.Notes getNotes() {
+    public Element getNotes() {
         return notes;
     }
 
@@ -570,7 +581,7 @@ public class ReactionWrapper {
         this.processSegmentIndex = processSegmentIndex;
     }
 
-    public void setReactionType(String reactionType) {
+    public void setReactionType(ReactionType reactionType) {
         this.reactionType = reactionType;
     }
 
@@ -582,7 +593,7 @@ public class ReactionWrapper {
         isReversible = reversible;
     }
 
-    public void setNotes(SBase.Notes notes) {
+    public void setNotes(Element notes) {
         this.notes = notes;
     }
 

@@ -1,9 +1,8 @@
 package fr.curie.cd2sbgnml.xmlcdwrappers;
 
-import org.apache.xmlbeans.SchemaType;
-import org.apache.xmlbeans.impl.schema.SchemaTypeImpl;
 import org.sbgn.bindings.Glyph;
 import org.sbml._2001.ns.celldesigner.*;
+import org.sbml.sbml.level2.version4.SBase;
 import org.sbml.sbml.level2.version4.Species;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -11,6 +10,7 @@ import org.w3c.dom.Element;
 import org.w3c.dom.Node;
 import org.w3c.dom.NodeList;
 
+import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -19,7 +19,7 @@ import java.util.List;
 /**
  * wraps species and includedSpecies as they have a lot in common
  */
-public class SpeciesWrapper {
+public class SpeciesWrapper implements INotesFeature, IAnnotationsFeature {
 
     private final Logger logger = LoggerFactory.getLogger(SpeciesWrapper.class);
 
@@ -40,19 +40,34 @@ public class SpeciesWrapper {
     private int multimer;
     private String structuralState;
     private ReferenceType type;
+    private String referenceId;
     private Element notes;
-    private Element referenceNotes;
     private Element annotations;
+    /**
+     * Unlike the notes member, referenceNotes store the notes of the species' reference entity (protein, rna, gene
+     * or asrna).
+     */
+    private Element referenceNotes;
+
+    /**
+     * Reactions in which the species was involved as a modifier.
+     * If connected through logic gates to a reaction, it must be listed.
+     * If the species is included, its topmost parent complex is the one that influences the reaction.
+     */
+    private List<String> catalyzedReactions;
 
     private List<AliasWrapper> aliases;
     private List<ResidueWrapper> residues;
 
-    public SpeciesWrapper(String id, String name, ReferenceType type) {
+    // TODO parse referenceIds in catalyzedreaction from CD objects
+    public SpeciesWrapper(String id, String name, ReferenceType type, String referenceId) {
         this.id = id;
         this.name = name;
         this.type = type;
+        this.referenceId = referenceId;
         this.aliases = new ArrayList<>();
         this.residues = new ArrayList<>();
+        this.catalyzedReactions = new ArrayList<>();
     }
 
     public SpeciesWrapper(Species species, ModelWrapper modelW) {
@@ -64,7 +79,7 @@ public class SpeciesWrapper {
         this.complex = null;
         this.notes = Utils.getNotes(species.getNotes());
         this.annotations = Utils.getRDFAnnotations(species.getAnnotation().getAny());
-        System.out.println("annotation for species: "+this.id+" "+this.annotations);
+        this.catalyzedReactions = new ArrayList<>();
 
         this.commonConstructor(species.getAnnotation().getExtension().getSpeciesIdentity(), modelW);
 
@@ -78,7 +93,6 @@ public class SpeciesWrapper {
         this.complex = species.getAnnotation().getComplexSpecies();
         this.compartment = null;
         this.notes = Utils.getNotes(species.getNotes());
-        //this.annotations = Utils.getRDFAnnotations(species.getAnnotation().); TODO not applicable ?
 
         this.commonConstructor(species.getAnnotation().getSpeciesIdentity(), modelW);
     }
@@ -169,7 +183,7 @@ public class SpeciesWrapper {
 
                 mapOfReferenceModif = new HashMap<>();
                 for (ModificationResidue modif : listOfReferenceModif) {
-                    System.out.println("Residue found for "+prot.getId()+" resid "+modif.getId()+" angle "+modif.getAngle());
+                    logger.debug("Residue found for "+prot.getId()+" resid "+modif.getId()+" angle "+modif.getAngle());
                     ResidueWrapper residueWrapper = new ResidueWrapper(modif.getId());
                     residueWrapper.angle = modif.getAngle().floatValue();
                     if(modif.getName() != null) {
@@ -177,7 +191,6 @@ public class SpeciesWrapper {
                     }
                     mapOfReferenceModif.put(residueWrapper.id, residueWrapper);
                 }
-                System.out.println(mapOfReferenceModif.size()+" res for protein "+protId);
                 logger.debug(mapOfReferenceModif.size()+" res for protein "+protId);
             }
 
@@ -221,7 +234,7 @@ public class SpeciesWrapper {
             if(gene.getListOfRegions() != null) {
                 // loop through reference list of regions
                 mapOfReferenceModif = mapOfRegion(gene.getListOfRegions());
-                System.out.println("GENE MODIF COUNT: "+mapOfReferenceModif.size()+" "+gene.getListOfRegions().getRegion().size());
+                logger.debug("GENE MODIF COUNT: "+mapOfReferenceModif.size()+" "+gene.getListOfRegions().getRegion().size());
 
             }
 
@@ -254,7 +267,7 @@ public class SpeciesWrapper {
 
                 // loop through the species' residues
                 for (ListOfModifications.Modification modif : listOfModif) {
-                    System.out.println("adding state: "+modif.getState()+" for res "+modif.getResidue());
+                    logger.debug("adding state: "+modif.getState()+" for res "+modif.getResidue());
                     String residueId = modif.getResidue();
                     ResidueWrapper residueWrapper = mapOfReferenceModif.get(residueId);
                     /*
@@ -275,7 +288,7 @@ public class SpeciesWrapper {
         }
         // finally set this species' residue wrapper list
         this.residues.addAll(mapOfReferenceModif.values());
-        System.out.println("final residue size for species "+this.getId()+" : "+this.residues.size());
+        logger.debug("final residue size for species "+this.getId()+" : "+this.residues.size());
 
     }
 
@@ -336,16 +349,7 @@ public class SpeciesWrapper {
         return mapOfReferenceModif;
     }
 
-    public Object getCDSpecies(String referenceId) {
-        if(this.isIncludedSpecies()) {
-            return this.getCDIncludedSpecies(referenceId);
-        }
-        else {
-            return this.getCDNormalSpecies(referenceId);
-        }
-    }
-
-    public Species getCDNormalSpecies(String referenceId) {
+    public Species getCDNormalSpecies() {
         Species species = new Species();
         species.setId(this.getId());
         species.setMetaid(this.getId());
@@ -360,12 +364,33 @@ public class SpeciesWrapper {
         SpeciesAnnotationType.Extension ext = new SpeciesAnnotationType.Extension();
         speciesAnnot.setExtension(ext);
         ext.setPositionToCompartment("inside");
-        ext.setSpeciesIdentity(getIdentity(referenceId));
+        ext.setSpeciesIdentity(getIdentity());
+
+        if(this.getCatalyzedReactions().size() > 0) {
+            ListOfCatalyzedReactions listOfCatalyzedReactions = new ListOfCatalyzedReactions();
+            ext.setListOfCatalyzedReactions(listOfCatalyzedReactions);
+
+            for(String reactionId: this.getCatalyzedReactions()) {
+                Catalyzed catalyzed = new Catalyzed();
+                catalyzed.setReaction(reactionId);
+                listOfCatalyzedReactions.getCatalyzed().add(catalyzed);
+            }
+        }
+
+        if(this.getNotes() != null) {
+            SBase.Notes notes = new SBase.Notes();
+            species.setNotes(notes);
+            notes.getAny().add(this.getNotes());
+        }
+
+        if(this.getAnnotations() != null) {
+            speciesAnnot.getAny().add(this.getAnnotations());
+        }
 
         return species;
     }
 
-    public org.sbml._2001.ns.celldesigner.Species getCDIncludedSpecies(String referenceId) {
+    public org.sbml._2001.ns.celldesigner.Species getCDIncludedSpecies() {
         org.sbml._2001.ns.celldesigner.Species species = new org.sbml._2001.ns.celldesigner.Species();
         species.setId(this.getId());
         species.setName(this.getName().isEmpty() ? this.getId() : this.getName());
@@ -374,12 +399,29 @@ public class SpeciesWrapper {
         species.setAnnotation(speciesAnnot);
 
         speciesAnnot.setComplexSpecies(this.getComplex());
-        speciesAnnot.setSpeciesIdentity(getIdentity(referenceId));
+        speciesAnnot.setSpeciesIdentity(getIdentity());
+
+        if(this.getNotes() != null) {
+            Notes notes = new Notes();
+            species.setNotes(notes);
+            notes.getAny().add(this.getNotes());
+        }
+
+        /*
+            putting rdf annotations in included species is impossible. The format doesn't allow it, and the interface
+            prevents you from doing it.
+        */
+        if(this.getAnnotations() != null) {
+            logger.error("Species: "+this.getId()+" with name "+this.getName()+" is an included species and has " +
+                    "rdf annotations. These annotations will be lost, due to CellDesigner not allowing them for" +
+                    "anything included inside a complex.");
+        }
+
 
         return species;
     }
 
-    private SpeciesIdentity getIdentity(String referenceId) {
+    private SpeciesIdentity getIdentity() {
         SpeciesIdentity ident = new SpeciesIdentity();
         ident.setClazz(this.getCdClass());
 
@@ -392,19 +434,47 @@ public class SpeciesWrapper {
                 case RECEPTOR:
                 case TRUNCATED:
                 case ION_CHANNEL:
-                    ident.setProteinReference(referenceId);
+                    ident.setProteinReference(this.getReferenceId());
                     break;
                 case RNA:
-                    ident.setRnaReference(referenceId);
+                    ident.setRnaReference(this.getReferenceId());
                     break;
                 case GENE:
-                    ident.setGeneReference(referenceId);
+                    ident.setGeneReference(this.getReferenceId());
                     break;
                 case ANTISENSE_RNA:
-                    ident.setAntisensernaReference(referenceId);
+                    ident.setAntisensernaReference(this.getReferenceId());
                     break;
             }
         }
+
+        if(this.getMultimer() > 0 || this.getResidues().size() > 0) {
+            State state = new State();
+            ident.setState(state);
+
+            if(this.getMultimer() > 0) {
+                state.setHomodimer(BigInteger.valueOf(this.getMultimer()));
+            }
+
+            if(this.getResidues().size() > 0) {
+                ListOfModifications listOfModifications = new ListOfModifications();
+                boolean atLeast1ResiduePresent = false;
+
+                for(ResidueWrapper resW: this.getResidues()) {
+                    if(resW.state != null && !resW.state.isEmpty()) {
+                        ListOfModifications.Modification modification = new ListOfModifications.Modification();
+                        modification.setResidue(resW.id);
+                        modification.setState(resW.state);
+                        listOfModifications.getModification().add(modification);
+                        atLeast1ResiduePresent = true;
+                    }
+                }
+                if(atLeast1ResiduePresent) {
+                    state.setListOfModifications(listOfModifications);
+                }
+            }
+        }
+
         return ident;
     }
 
@@ -541,5 +611,21 @@ public class SpeciesWrapper {
 
     public void setResidues(List<ResidueWrapper> residues) {
         this.residues = residues;
+    }
+
+    public List<String> getCatalyzedReactions() {
+        return catalyzedReactions;
+    }
+
+    public void setCatalyzedReactions(List<String> catalyzedReactions) {
+        this.catalyzedReactions = catalyzedReactions;
+    }
+
+    public String getReferenceId() {
+        return referenceId;
+    }
+
+    public void setReferenceId(String referenceId) {
+        this.referenceId = referenceId;
     }
 }

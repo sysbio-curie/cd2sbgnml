@@ -13,3 +13,11 @@ The xsd files in the `schema` directory comes from <https://github.com/funasoul/
    - `reactantLink`
    - `productLink`
  * For `modification` elements who are logic gates, the `modification` attribute was changed to `modificationType`
+ * Following values were added as possible base reaction types:
+   - PHYSICAL_STIMULATION
+   - POSITIVE_INFLUENCE
+   - NEGATIVE_INFLUENCE
+   - REDUCED_MODULATION
+   - REDUCED_TRIGGER
+ * `<listOfGateMembers>` and `<GateMember>` elements were added to be able to manage reactions of type BOOLEAN_LOGIC_GATE.
+ The `BOOLEAN_LOGIC_GATE` value was added to the reaction type enum.

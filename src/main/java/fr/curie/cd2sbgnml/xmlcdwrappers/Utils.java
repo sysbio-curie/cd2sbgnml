@@ -1,12 +1,13 @@
 package fr.curie.cd2sbgnml.xmlcdwrappers;
 
 import com.sun.xml.bind.marshaller.NamespacePrefixMapper;
-import org.apache.xmlbeans.XmlObject;
+import org.sbml._2001.ns.celldesigner.Bounds;
 import org.sbml._2001.ns.celldesigner.Notes;
 import org.sbml.sbml.level2.version4.SBase;
 import org.w3c.dom.Element;
-import org.w3c.dom.Node;
 
+import java.awt.geom.Rectangle2D;
+import java.math.BigDecimal;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -84,16 +85,8 @@ public class Utils {
      * @return
      */
     public static boolean isNoteEmpty(Element note) {
-        //System.out.println("note is empty?");
         Element title = (Element) note.getElementsByTagName("title").item(0);
         Element body = (Element) note.getElementsByTagName("body").item(0);
-
-        /*System.out.println(title.getChildNodes().getLength());
-        System.out.println(body.getChildNodes().getLength());
-
-        if(body.getChildNodes().getLength() != 1) {
-            System.out.println(">>>>>>>>>>>>>>>>");
-        }*/
 
         return (title == null || title.getChildNodes().getLength() == 0)
                 && (body == null || body.getChildNodes().getLength() == 0);
@@ -178,6 +171,80 @@ public class Utils {
     }
 
     /**
+     * Resolve some special chars as CellDesigner specific encoding.
+     * @param s
+     * @return
+     */
+    public static String UTF8charsToCD(String s) {
+        // special chars
+        String newString =
+                s.replaceAll("\\n", "_br_") // actual line break
+                .replaceAll("\n", "_br_") // literal \n
+                .replaceAll("&#10;", "_br_") // encoded line break
+                .replaceAll("\\+", "_plus_")
+                .replaceAll("-", "_minus_")
+                .replaceAll("/", "_slash_")
+                //.replaceAll("_", "_underscore_")
+                .replaceAll(" ", "_space_");
+
+        // greek small letters
+        newString = newString
+                .replaceAll("α","_alpha_")
+                .replaceAll("β","_beta_")
+                .replaceAll("γ","_gamma_")
+                .replaceAll("δ","_delta_")
+                .replaceAll("ε","_epsilon_")
+                .replaceAll("ζ","_zeta_")
+                .replaceAll("η","_eta_")
+                .replaceAll("θ","_theta_")
+                .replaceAll("ι","_iota_")
+                .replaceAll("κ","_kappa_")
+                .replaceAll("λ","_lambda_")
+                .replaceAll("μ","_mu_")
+                .replaceAll("ν","_nu_")
+                .replaceAll("ξ","_xi_")
+                .replaceAll("ο","_omicron_")
+                .replaceAll("π","_pi_")
+                .replaceAll("ρ","_rho_")
+                .replaceAll("σ","_sigma_")
+                .replaceAll("τ","_tau_")
+                .replaceAll("υ","_upsilon_")
+                .replaceAll("φ","_phi_")
+                .replaceAll("χ","_chi_")
+                .replaceAll("ψ","_psi_")
+                .replaceAll("ω","_omega_");
+
+        // greek capital letters
+        newString = newString
+                .replaceAll("Α", "_Alpha_")
+                .replaceAll("Β", "_Beta_")
+                .replaceAll("Γ", "_Gamma_")
+                .replaceAll("Δ", "_Delta_")
+                .replaceAll("Ε", "_Epsilon_")
+                .replaceAll("Ζ", "_Zeta_")
+                .replaceAll("Η", "_Eta_")
+                .replaceAll("Θ", "_Theta_")
+                .replaceAll("Ι", "_Iota_")
+                .replaceAll("Κ", "_Kappa_")
+                .replaceAll("Λ", "_Lambda_")
+                .replaceAll("Μ", "_Mu_")
+                .replaceAll("Ν", "_Nu_")
+                .replaceAll("Ξ", "_Xi_")
+                .replaceAll("Ο", "_Omicron_")
+                .replaceAll("Π", "_Pi_")
+                .replaceAll("Ρ", "_Rho_")
+                .replaceAll("Σ", "_Sigma_")
+                .replaceAll("Τ", "_Tau_")
+                .replaceAll("Υ", "_Upsilon_")
+                .replaceAll("Φ", "_Phi_")
+                .replaceAll("Χ", "_Chi_")
+                .replaceAll("Ψ", "_Psi_")
+                .replaceAll("Ω", "_Omega_");
+
+        return newString;
+    }
+
+    /**
      * Get the RDF element from an annotation element, if present
      * @param annotationsXml
      * @return
@@ -209,6 +276,31 @@ public class Utils {
         public String getPreferredPrefix(String namespaceUri, String suggestion, boolean requirePrefix) {
             return namespaceMap.getOrDefault(namespaceUri, suggestion);
         }
+    }
+
+    /**
+     * @param b a CellDesigner Bound xml element
+     * @return the corresponding Rectangle2D
+     */
+    public static Rectangle2D bounds2Rect(Bounds b) {
+        return new Rectangle2D.Float(
+                b.getX().floatValue(),
+                b.getY().floatValue(),
+                b.getW().floatValue(),
+                b.getH().floatValue());
+    }
+
+    /**
+     * @param r a Rectangle2D
+     * @return the corresponding CellDesigner Bounds xml element
+     */
+    public static Bounds rect2Bounds(Rectangle2D r) {
+        Bounds b = new Bounds();
+        b.setX(BigDecimal.valueOf(r.getX()));
+        b.setY(BigDecimal.valueOf(r.getY()));
+        b.setW(BigDecimal.valueOf(r.getWidth()));
+        b.setH(BigDecimal.valueOf(r.getHeight()));
+        return b;
     }
 
 }

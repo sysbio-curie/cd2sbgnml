@@ -5,12 +5,10 @@ import org.sbml._2001.ns.celldesigner.*;
 import org.sbml.sbml.level2.version4.Reaction;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.w3c.dom.Node;
 
 import java.awt.geom.Point2D;
 import java.util.AbstractMap.SimpleEntry;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
 
 /**
@@ -22,21 +20,6 @@ public class ReactantWrapper {
     private static final Logger logger = LoggerFactory.getLogger(ReactantWrapper.class);
 
     public enum ReactantType {BASE_REACTANT, BASE_PRODUCT, ADDITIONAL_REACTANT, ADDITIONAL_PRODUCT, MODIFICATION}
-    public enum ModificationLinkType {
-        CATALYSIS, UNKNOWN_CATALYSIS,
-        INHIBITION, UNKNOWN_INHIBITION,
-        TRANSPORT,
-        HETERODIMER_ASSOCIATION, DISSOCIATION,
-        TRANSCRIPTIONAL_ACTIVATION, TRANSCRIPTIONAL_INHIBITION,
-        TRANSLATIONAL_ACTIVATION, TRANSLATIONAL_INHIBITION,
-        PHYSICAL_STIMULATION, MODULATION, TRIGGER,
-        REDUCED_TRIGGER, NEGATIVE_INFLUENCE,
-        BOOLEAN_LOGIC_GATE_OR,
-        BOOLEAN_LOGIC_GATE_AND,
-        BOOLEAN_LOGIC_GATE_NOT,
-        BOOLEAN_LOGIC_GATE_UNKNOWN
-    }
-
 
     private ReactantType reactantType;
     private AliasWrapper aliasW;
@@ -66,6 +49,17 @@ public class ReactantWrapper {
     public ReactantWrapper (AliasWrapper aliasW, ReactantType type) {
         this.aliasW = aliasW;
         this.reactantType = type;
+    }
+
+    public ReactantWrapper (ReactantWrapper w) {
+        this.reactantType = w.getReactantType();
+        this.modificationLinkType = w.getModificationLinkType();
+        this.aliasW = w.getAliasW();
+        this.targetLineIndex = w.getTargetLineIndex();
+        this.anchorPoint = w.getAnchorPoint();
+        this.lineWrapper = w.getLineWrapper();
+        this.logicGate = w.getLogicGate();
+        this.positionIndex = w.getPositionIndex();
     }
 
     private ReactantWrapper (BaseReactant baseReactant, AliasWrapper aliasW) {
@@ -108,18 +102,7 @@ public class ReactantWrapper {
         // get reactanct's link anchor point
         this.anchorPoint = AnchorPoint.CENTER; // default to center
         if(reactantLink.getLinkAnchor() != null) {
-            // !!!!!!! limitation of the API here, getCelldesignerLinkAnchor() crashes !!!
-
             this.anchorPoint = AnchorPoint.valueOf(reactantLink.getLinkAnchor().getPosition());
-
-            /*for(int i=0; i < reactantLink.getDomNode().getChildNodes().getLength(); i++) {
-                Node n = reactantLink.getDomNode().getChildNodes().item(i);
-                if(n.getNodeName().equals("celldesigner_linkAnchor") &&
-                        ! n.getAttributes().getNamedItem("position").getNodeValue().equals("INACTIVE")) {
-                    this.anchorPoint = AnchorPoint.valueOf(n.getAttributes().getNamedItem("position").getNodeValue());
-                    break;
-                }
-            }*/
         }
 
         this.lineWrapper = new LineWrapper(reactantLink.getConnectScheme(),
@@ -137,16 +120,7 @@ public class ReactantWrapper {
         // get reactanct's link anchor point
         this.anchorPoint = AnchorPoint.CENTER; // default to center
         if(productLink.getLinkAnchor() != null) {
-            // !!!!!!! limitation of the API here, getCelldesignerLinkAnchor() crashes !!!
             this.anchorPoint = AnchorPoint.valueOf(productLink.getLinkAnchor().getPosition());
-            /*for(int i=0; i < productLink.getDomNode().getChildNodes().getLength(); i++) {
-                Node n = productLink.getDomNode().getChildNodes().item(i);
-                if(n.getNodeName().equals("celldesigner_linkAnchor") &&
-                        ! n.getAttributes().getNamedItem("position").getNodeValue().equals("INACTIVE")) {
-                    this.anchorPoint = AnchorPoint.valueOf(n.getAttributes().getNamedItem("position").getNodeValue());
-                    break;
-                }
-            }*/
         }
 
         this.lineWrapper = new LineWrapper(productLink.getConnectScheme(),
@@ -290,37 +264,6 @@ public class ReactantWrapper {
         return Integer.parseInt(targetLineIndex.split(",")[1]);
     }
 
-    public List<Point2D.Float> getEditPointsForBranch(int b) {
-        List<Point2D.Float> editPoints = this.getLineWrapper().getEditPoints();
-        int num0 = this.getLineWrapper().getNum0();
-        int num1 = this.getLineWrapper().getNum1();
-        int num2 = this.getLineWrapper().getNum2();
-
-        List<Point2D.Float> finalEditPoints = new ArrayList<>();
-        switch(b) {
-            case 0:
-                for(int i=0; i < num0; i++) {
-                    finalEditPoints.add(editPoints.get(i));
-                }
-                break;
-            case 1:
-                for(int i=num0; i < num0 + num1; i++) {
-                    finalEditPoints.add(editPoints.get(i));
-                }
-                break;
-            case 2:
-                // don't go to the end of edit points list, last one may be
-                // for association/dissociation point or for logic gate
-                for(int i=num0 + num1; i < num0 + num1 + num2; i++) {
-                    finalEditPoints.add(editPoints.get(i));
-                }
-                break;
-            default:
-                throw new RuntimeException("Value: "+b+" not allowed for branch index. Authorized values: 0, 1, 2.");
-        }
-        return finalEditPoints;
-    }
-
     public Object getCDElement() {
         switch(this.reactantType) {
             case BASE_REACTANT:
@@ -388,34 +331,38 @@ public class ReactantWrapper {
 
 
             case MODIFICATION:
-                Modification modification = new Modification();
-                modification.setModifiers(this.getAliasW().getSpeciesW().getId());
-                modification.setAliases(this.getAliasW().getId());
-                modification.setTargetLineIndex(this.getTargetLineIndex());
-                modification.setType(this.getModificationLinkType().toString());
-                if(this.getAnchorPoint() != AnchorPoint.CENTER) { // no linkAnchor when center
-                    LinkTarget linkTarget = new LinkTarget();
-                    linkTarget.setSpecies(this.getAliasW().getSpeciesW().getId());
-                    linkTarget.setAlias(this.getAliasW().getId());
-
-                    LinkAnchor linkAnchor = new LinkAnchor();
-                    linkAnchor.setPosition(this.getAnchorPoint().toString());
-                    linkTarget.setLinkAnchor(linkAnchor);
-
-                    modification.getLinkTarget().add(linkTarget);
-                }
-
-                modification.setConnectScheme(this.getLineWrapper().getCDConnectScheme());
-                modification.setLine(this.getLineWrapper().getCDLine());
-                if(this.getLineWrapper().getEditPoints().size() > 0) {
-                    for(String s: this.getLineWrapper().editPointsAsStringList()){
-                        modification.getEditPoints().add(s);
-                    }
-                }
-
-                return modification;
+                return this.getAsModification();
         }
         throw new RuntimeException("Reactant type was not defined properly.");
+    }
+
+    public Modification getAsModification() {
+        Modification modification = new Modification();
+        modification.setModifiers(this.getAliasW().getSpeciesW().getId());
+        modification.setAliases(this.getAliasW().getId());
+        modification.setTargetLineIndex(this.getTargetLineIndex());
+        modification.setType(this.getModificationLinkType().toString());
+        if(this.getAnchorPoint() != AnchorPoint.CENTER) { // no linkAnchor when center
+            LinkTarget linkTarget = new LinkTarget();
+            linkTarget.setSpecies(this.getAliasW().getSpeciesW().getId());
+            linkTarget.setAlias(this.getAliasW().getId());
+
+            LinkAnchor linkAnchor = new LinkAnchor();
+            linkAnchor.setPosition(this.getAnchorPoint().toString());
+            linkTarget.setLinkAnchor(linkAnchor);
+
+            modification.getLinkTarget().add(linkTarget);
+        }
+
+        modification.setConnectScheme(this.getLineWrapper().getCDConnectScheme());
+        modification.setLine(this.getLineWrapper().getCDLine());
+        if(this.getLineWrapper().getEditPoints().size() > 0) {
+            for(String s: this.getLineWrapper().editPointsAsStringList()){
+                modification.getEditPoints().add(s);
+            }
+        }
+
+        return modification;
     }
 
     public static boolean isLogicGate(Modification modif) {
@@ -430,26 +377,13 @@ public class ReactantWrapper {
         return reactantType;
     }
 
-    /*public LinkWrapper getLink() {
-        return link;
-    }*/
-
-    /*public void setLink(LinkWrapper link) {
-        this.link = link;
-    }*/
-
     public float getHeight() {
-        return this.aliasW.getBounds().getH().floatValue();
+        return (float) this.aliasW.getBounds().getHeight();
     }
 
     public float getWidth() {
-        return this.aliasW.getBounds().getW().floatValue();
+        return (float) this.aliasW.getBounds().getWidth();
     }
-
-    /*@Override
-    public SpeciesWrapper.CdShape getShape() {
-        return this.aliasW.getSpeciesW().getCdShape();
-    }*/
 
     public AnchorPoint getAnchorPoint() {
         return anchorPoint;

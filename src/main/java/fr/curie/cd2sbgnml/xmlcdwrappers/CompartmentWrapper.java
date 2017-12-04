@@ -12,7 +12,7 @@ import java.awt.geom.Point2D;
 import java.awt.geom.Rectangle2D;
 import java.math.BigDecimal;
 
-public class CompartmentWrapper {
+public class CompartmentWrapper implements INotesFeature, IAnnotationsFeature {
 
     private final Logger logger = LoggerFactory.getLogger(CompartmentWrapper.class);
 
@@ -76,9 +76,12 @@ public class CompartmentWrapper {
 
         extension.setName(this.getName());
 
-        SBase.Notes notes = new SBase.Notes();
-        notes.getAny().add(this.getNotes());
-        compartment.setNotes(notes);
+        if(this.getNotes() != null
+                && !Utils.isNoteEmpty(this.getNotes())) {
+            SBase.Notes notes = new SBase.Notes();
+            notes.getAny().add(this.getNotes());
+            compartment.setNotes(notes);
+        }
 
         annotation.getAny().add(this.getAnnotations());
         return compartment;
