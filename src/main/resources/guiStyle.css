@@ -1,0 +1,50 @@
+.root {
+    -fx-background: #616161;
+    -fx-font-family: Roboto, Calibri, Arial, sans-serif;
+    -fx-focus-color: transparent;
+    -fx-faint-focus-color: transparent;
+}
+
+.button {
+    -fx-background-color: #373737;
+    -fx-text-fill: white;
+    -fx-cursor: hand;
+    -fx-padding: 5px;
+    -fx-background-radius: 4px;
+}
+
+.button.toggle {
+    -fx-padding: 10px;
+    -fx-font-weight: bold;
+}
+
+.button.normal:pressed {
+    -fx-background-color: #1976d2;
+}
+
+.button.normal.important {
+    -fx-padding: 10px;
+    -fx-font-weight: bold;
+}
+
+.glyph-icon {
+    -fx-fill: white;
+}
+
+.label.bold {
+    -fx-font-weight: bold;
+}
+
+.small {
+    -fx-font-size: 10px;
+    -fx-text-fill: white;
+    -fx-fill: white;
+}
+
+.hyperlink:visited {
+    -fx-border-width: 0px;
+}
+
+.progress-indicator {
+    -fx-progress-color: white;
+}
